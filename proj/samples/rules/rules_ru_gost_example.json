@@ -1,0 +1,12 @@
+{
+"version": 1,
+"locale": "RU",
+"heights_cm": {"socket": 30, "switch": 90, "ceiling_light": 250},
+"min_offsets_cm": {"corner": 10, "door": 15, "wet_zone": 60},
+"per_room_requirements": {
+"LIVING": {"socket_per_wall_meter": 0.4, "min_switches": 1, "lights": 1},
+"BEDROOM": {"socket_per_wall_meter": 0.3, "min_switches": 1, "lights": 1}
+},
+"routing": {"h_trunk_height_cm": 20, "v_only_vertical": true,
+"avoid_doors": true, "penalties": {"door_cross": 1000}}
+}

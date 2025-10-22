@@ -1,0 +1,9 @@
+{
+	"type": "FeatureCollection",
+	"features": [
+		{"type": "Feature", "properties": {"name": "living"},
+		"geometry": {"type": "Polygon", "coordinates": [[[0,0],[6,0],[6,4],[0,4],[0,0]]]}}
+		,{"type": "Feature", "properties": {"name": "bedroom"},
+		"geometry": {"type": "Polygon", "coordinates": [[[6,0],[10,0],[10,4],[6,4],[6,0]]]}}
+	]
+}
