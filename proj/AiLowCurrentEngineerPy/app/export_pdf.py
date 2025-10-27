@@ -2,6 +2,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 
+
 # Примитив: просто точки и линии в миллиметрах, без масштабов (MVP)
 def export_pdf(project_id: str, rooms, devices, routes, out_path: str):
     c = canvas.Canvas(out_path, pagesize=A4)
