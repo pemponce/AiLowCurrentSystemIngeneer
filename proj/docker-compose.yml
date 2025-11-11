@@ -58,6 +58,8 @@ services:
     volumes:
       - ./samples/rules/rules_ru_gost_example.json:/app/rules.json:ro
       - ./samples/dxf/:/data/:ro
+      - ./samples:/samples:ro
+
     ports: ["8000:8000"]
 
   minio-init:

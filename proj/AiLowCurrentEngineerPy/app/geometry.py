@@ -8,7 +8,7 @@ DB = {
 }
 
 
-def load_sample_rooms(project_id: str, path: str = '/app/../samples/geojson/simple_apartment.geojson'):
+def load_sample_rooms(project_id: str, path: str = '../../samples/geojson/simple_apartment.geojson'):
     with open(path, 'r', encoding='utf-8') as f:
         gj = json.load(f)
     rooms = [shape(feat['geometry']) for feat in gj['features']]

@@ -1,4 +1,6 @@
 from fastapi import FastAPI
+
+from app.lighting import design_lighting, LightingRequest, LightingResponse
 from app.models import IngestRequest, PlaceRequest, RouteRequest, ExportRequest
 from app.geometry import load_sample_rooms, DB
 from app.placement import generate_candidates, select_devices
@@ -11,7 +13,9 @@ from app.bom import make_bom
 from app.minio_client import upload_file
 import os
 
-app = FastAPI()
+app = FastAPI(
+    title="Low-Current Planner"
+)
 
 
 @app.post('/ingest')
@@ -24,6 +28,17 @@ async def ingest(req: IngestRequest):
     else:
         rooms = load_sample_rooms(req.project_id)
         return {"project_id": req.project_id, "rooms": len(rooms), "note": "fallback to sample geojson"}
+
+
+@app.post("/lighting", response_model=LightingResponse)
+async def lighting(req: LightingRequest) -> LightingResponse:
+    """
+    Расчёт схемы освещения:
+    - распределяет заданное количество светильников по комнатам,
+    - рассчитывает поток и мощность,
+    - возвращает координаты размещения.
+    """
+    return design_lighting(req)
 
 
 @app.get("/health", tags=["health"])
