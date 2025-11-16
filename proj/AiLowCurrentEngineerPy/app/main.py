@@ -1,4 +1,7 @@
+from typing import Optional, Dict, Literal, List
+
 from fastapi import FastAPI
+from pydantic import BaseModel
 
 from app.lighting import design_lighting, LightingRequest, LightingResponse
 from app.models import IngestRequest, PlaceRequest, RouteRequest, ExportRequest
@@ -89,3 +92,58 @@ async def export(req: ExportRequest):
         except Exception as e:
             uploaded.append(f"ERROR:{e}")
     return {"project_id": req.project_id, "files": out, "uploaded": uploaded}
+
+
+class PreferenceParseRequest(BaseModel):
+    text: str
+    # опционально, фиксированные единицы измерения/язык
+    locale: Optional[str] = "ru"
+
+
+class PreferenceParseResponse(BaseModel):
+    # нормализованные цели освещенности (если конкретные комнаты названы в тексте)
+    per_room_target_lux: Optional[Dict[str, float]] = None
+    # общий target_lux, если нет явного деления по комнатам
+    target_lux: Optional[float] = None
+    # желаемое кол-во светильников (если указал пользователь)
+    total_fixtures_hint: Optional[int] = None
+    # эффективность (если написал “лампы 100 лм/Вт” и т.п.)
+    fixture_efficacy_lm_per_w: Optional[float] = None
+    # комментарии/несмогли распарсить
+    notes: Optional[str] = None
+
+
+class ProjectCreateRequest(BaseModel):
+    project_id: str
+    # имя файла, который ожидаем загрузить (для ссылки и проверки)
+    filename: Optional[str] = None
+
+
+class ProjectCreateResponse(BaseModel):
+    project_id: str
+    upload_kind: Literal["multipart", "s3"] = "multipart"
+    # если когда-нибудь сделаем presigned URL — сюда положим
+    upload_url: Optional[str] = None
+
+
+class InferRequest(BaseModel):
+    """
+    Единая точка входа из UI: пользователь загрузил DXF/DWG и написал пожелания.
+    """
+    project_id: str
+    user_preferences_text: str
+    # fallback-значения, если из текста ничего не распарсили
+    default_total_fixtures: int = 20
+    default_target_lux: float = 300.0
+    fixture_efficacy_lm_per_w: float = 110.0
+    maintenance_factor: float = 0.8
+    utilization_factor: float = 0.6
+    export_formats: List[Literal['PDF', 'DXF', 'PNG']] = ['PDF']
+
+
+class InferResponse(BaseModel):
+    project_id: str
+    parsed: PreferenceParseResponse
+    lighting: LightingResponse
+    exported_files: List[str] = []
+    uploaded_uris: List[str] = []
