@@ -43,6 +43,8 @@ services:
       - S3_BUCKET_RAW
       - S3_BUCKET_EXPORTS
       - PLANNER_URL
+      - JWT_SECRET_BASE64
+      - JWT_TTL_MS
     ports: ["8080:8080"]
     depends_on: [db, minio, planner]
 
