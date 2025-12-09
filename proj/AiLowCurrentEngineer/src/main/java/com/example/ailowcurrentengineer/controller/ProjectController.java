@@ -31,7 +31,7 @@ public class ProjectController {
 
     @PostMapping("/{id}/upload")
     public ResponseEntity<UploadResponse> upload(@PathVariable String id, @RequestParam MultipartFile file) throws Exception {
-        Long pid = Long.getLong(id);
+        Long pid = Long.parseLong(id);;
 
         // 1) кладём в MinIO
         String key = s3.uploadRawPlan(id, file);
