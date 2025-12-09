@@ -27,6 +27,8 @@ security:
     secret: cXeLRverb9aiz/7cvXztl9RkSkMVPV4fX/Q1utchsx8hw1VWENf52QE/26bbsEHrQ0DDHzoKf+zYgXEwwrf8Zg==
     ttlMillis: 86400000
 
+planner:
+  url: http://localhost:8000
 
 s3:
   endpoint: http://minio:9000

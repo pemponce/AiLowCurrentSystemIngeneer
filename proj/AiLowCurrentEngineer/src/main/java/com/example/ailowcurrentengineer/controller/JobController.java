@@ -20,6 +20,7 @@ public class JobController {
     private final JobService jobService;
     private final ObjectMapper om = new ObjectMapper();
 
+
     @PostMapping("/run")
     public ResponseEntity<JobResponse> run(@RequestBody RunJobRequest req) {
         // создать Job(PENDING) → RUNNING → DONE/ERROR (синхронно)

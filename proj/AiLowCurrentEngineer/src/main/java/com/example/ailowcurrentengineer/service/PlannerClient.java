@@ -1,6 +1,9 @@
 package com.example.ailowcurrentengineer.service;
 
 import com.example.ailowcurrentengineer.dto.PlannerDtos.*;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -13,11 +16,11 @@ public class PlannerClient {
 
   private final WebClient wc;
 
-  public PlannerClient(WebClient plannerWebClient) {
-    this.wc = plannerWebClient;
-  }
+    public PlannerClient(@Qualifier("plannerWebClient") WebClient plannerWebClient) {
+        this.wc = plannerWebClient;
+    }
 
-  public IngestResponse ingest(String projectId, String srcKey) {
+    public IngestResponse ingest(String projectId, String srcKey) {
     IngestRequest req = new IngestRequest(projectId, srcKey);
     return wc.post()
         .uri("/ingest")

@@ -27,7 +27,22 @@ public class S3Service {
     this.bucketExports = bucketExports;
   }
 
-  public String uploadRawPlan(String projectId, MultipartFile file) throws Exception {
+    public String uploadRawBytes(String objectKey, byte[] data, String contentType) throws Exception {
+        ensureBucket(bucketRaw);
+        try (var in = new java.io.ByteArrayInputStream(data)) {
+            PutObjectArgs args = PutObjectArgs.builder()
+                    .bucket(bucketRaw)
+                    .object(objectKey)
+                    .stream(in, data.length, -1)
+                    .contentType(contentType != null ? contentType : "application/octet-stream")
+                    .build();
+            minio.putObject(args);
+        }
+        return objectKey;
+    }
+
+
+    public String uploadRawPlan(String projectId, MultipartFile file) throws Exception {
     ensureBucket(bucketRaw);
 
     String key = "raw-plans/" + projectId + "/" + UUID.randomUUID() + "-" + sanitize(file.getOriginalFilename());

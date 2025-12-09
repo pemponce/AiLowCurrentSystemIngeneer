@@ -17,7 +17,11 @@ public class SecurityConfig {
       .csrf(AbstractHttpConfigurer::disable) // REST без браузера
       .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
       .authorizeHttpRequests(auth -> auth
-        .requestMatchers("/api/**").permitAll()  // регистрация/логин открыты
+              .requestMatchers(
+                      "/api/public/**",
+                      "/plans/**",          // статик
+                      "/api/projects/**"
+              ).permitAll()  // регистрация/логин открыты
         .anyRequest().authenticated()
       )
       .httpBasic(Customizer.withDefaults()); // можно убрать, просто удобно для тестов

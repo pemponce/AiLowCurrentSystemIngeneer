@@ -1,10 +1,11 @@
-from typing import Optional, Dict, Literal, List
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Optional, List, Literal, Dict
+import re as regex
 
-from fastapi import FastAPI
-from pydantic import BaseModel
-
+from app.geometry_png import ingest_png
 from app.lighting import design_lighting, LightingRequest, LightingResponse
-from app.models import IngestRequest, PlaceRequest, RouteRequest, ExportRequest
+from app.models import IngestRequest, PlaceRequest, RouteRequest, ExportRequest, InferResponse, InferRequest
 from app.geometry import load_sample_rooms, DB
 from app.placement import generate_candidates, select_devices
 from app.routing import route_all
@@ -23,11 +24,24 @@ app = FastAPI(
 
 @app.post('/ingest')
 async def ingest(req: IngestRequest):
-    # Если путь указывает на локальный файл — читаем его; иначе fallback на sample
+    # защитим структуру БД от KeyError
+    DB.setdefault('rooms', {}).setdefault(req.project_id, [])
+    DB.setdefault('devices', {}).setdefault(req.project_id, [])
+    DB.setdefault('routes', {}).setdefault(req.project_id, [])
+    DB.setdefault('candidates', {}).setdefault(req.project_id, [])
+
     path = f"/data/{os.path.basename(req.src_s3_key)}"
+
     if os.path.exists(path):
-        stats = ingest_dxf(req.project_id, path)
-        return {"project_id": req.project_id, **stats}
+        low = path.lower()
+        if low.endswith(('.dxf', '.dwg')):
+            stats = ingest_dxf(req.project_id, path)
+            return {"project_id": req.project_id, **stats}
+        elif low.endswith(('.png', '.jpg', '.jpeg')):
+            stats = ingest_png(req.project_id, path)     # <<< НОВОЕ
+            return {"project_id": req.project_id, **stats}
+        else:
+            raise HTTPException(status_code=415, detail="Unsupported file type")
     else:
         rooms = load_sample_rooms(req.project_id)
         return {"project_id": req.project_id, "rooms": len(rooms), "note": "fallback to sample geojson"}
@@ -94,6 +108,65 @@ async def export(req: ExportRequest):
     return {"project_id": req.project_id, "files": out, "uploaded": uploaded}
 
 
+from fastapi import HTTPException
+
+
+@app.post('/infer', response_model=InferResponse)
+async def infer(req: InferRequest) -> InferResponse:
+    DB.setdefault('rooms', {})
+    DB.setdefault('devices', {})
+    DB.setdefault('routes', {})
+    DB.setdefault('candidates', {})
+
+    if req.project_id not in DB['rooms'] or not DB['rooms'][req.project_id]:
+        DB['rooms'][req.project_id] = load_sample_rooms(req.project_id)
+        DB['devices'][req.project_id] = []
+        DB['routes'][req.project_id] = []
+        DB['candidates'][req.project_id] = []
+
+    # 1) распарсим пожелания пользователя
+    text = req.user_preferences_text or ''
+    parsed = PreferenceParseResponse()
+
+    # пример: вытащить target_lux из текста "300 люкс"
+    m = regex.search(r'(\d{2,4})\s*люкс', text.lower())
+    if m:
+        parsed.target_lux = float(m.group(1))
+
+    # fallback если не было в тексте
+    target_lux = parsed.target_lux or req.default_target_lux
+    total = req.default_total_fixtures
+
+    # 2) lighting
+    lighting_req = LightingRequest(
+        project_id=req.project_id,
+        total_fixtures=total,
+        target_lux=target_lux,
+        efficacy_lm_per_w=req.fixture_efficacy_lm_per_w,
+        maintenance_factor=req.maintenance_factor,
+        utilization_factor=req.utilization_factor,
+    )
+    lighting_res = design_lighting(lighting_req)
+
+    # 3) place + route
+    _ = generate_candidates(req.project_id)
+    _ = select_devices(req.project_id, DB['candidates'][req.project_id])
+    _ = validate_project(req.project_id)
+    routes = route_all(req.project_id)
+
+    # 4) export
+    export_req = ExportRequest(project_id=req.project_id, formats=req.export_formats)
+    exported = await export(export_req)  # если export у тебя sync — вызови синхронно
+
+    return InferResponse(
+        project_id=req.project_id,
+        parsed=parsed,
+        lighting=lighting_res,
+        exported_files=exported.get('files', []),
+        uploaded_uris=exported.get('uploaded', []),
+    )
+
+
 class PreferenceParseRequest(BaseModel):
     text: str
     # опционально, фиксированные единицы измерения/язык
@@ -127,23 +200,33 @@ class ProjectCreateResponse(BaseModel):
 
 
 class InferRequest(BaseModel):
-    """
-    Единая точка входа из UI: пользователь загрузил DXF/DWG и написал пожелания.
-    """
-    project_id: str
-    user_preferences_text: str
-    # fallback-значения, если из текста ничего не распарсили
-    default_total_fixtures: int = 20
-    default_target_lux: float = 300.0
-    fixture_efficacy_lm_per_w: float = 110.0
-    maintenance_factor: float = 0.8
-    utilization_factor: float = 0.6
-    export_formats: List[Literal['PDF', 'DXF', 'PNG']] = ['PDF']
+    # алиасы под вход от Java (camelCase)
+    project_id: str = Field(alias='projectId')
+    user_preferences_text: str = Field('', alias='preferencesText')
+
+    default_total_fixtures: int = Field(20, alias='totalFixtures')
+    default_target_lux: float = Field(300.0, alias='targetLux')
+    fixture_efficacy_lm_per_w: float = Field(110.0, alias='efficacyLmPerW')
+    maintenance_factor: float = Field(0.8, alias='maintenanceFactor')
+    utilization_factor: float = Field(0.6, alias='utilizationFactor')
+
+    export_formats: List[Literal['PDF', 'DXF', 'PNG']] = Field(default_factory=lambda: ['PDF'], alias='exportFormats')
+
+    # позволяем наполнять поля по алиасам (camelCase)
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PreferenceParseResponse(BaseModel):
+    per_room_target_lux: Optional[dict[str, float]] = None
+    target_lux: Optional[float] = None
+    total_fixtures_hint: Optional[int] = None
+    fixture_efficacy_lm_per_w: Optional[float] = None
+    notes: Optional[str] = None
 
 
 class InferResponse(BaseModel):
     project_id: str
     parsed: PreferenceParseResponse
-    lighting: LightingResponse
+    lighting: "LightingResponse"
     exported_files: List[str] = []
     uploaded_uris: List[str] = []

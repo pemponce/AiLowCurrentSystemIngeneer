@@ -7,8 +7,9 @@ import org.springframework.web.reactive.function.client.WebClient;
 
 @Configuration
 public class PlannerClientConfig {
-  @Bean
-  public WebClient plannerWebClient(@Value("${planner.url}") String baseUrl) {
-    return WebClient.builder().baseUrl(baseUrl).build();
-  }
+    @Bean("plannerWebClient")
+    WebClient plannerWebClient(@Value("${planner.url}") String baseUrl,
+                               WebClient.Builder builder) {
+        return builder.baseUrl(baseUrl).build();
+    }
 }

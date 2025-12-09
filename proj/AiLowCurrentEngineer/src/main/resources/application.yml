@@ -27,6 +27,8 @@ security:
     secret: ${JWT_SECRET_BASE64}
     ttlMillis: ${JWT_TTL_MS}
 
+planner:
+  url: ${PLANNER_URL}
 
 s3:
   endpoint: ${S3_ENDPOINT}

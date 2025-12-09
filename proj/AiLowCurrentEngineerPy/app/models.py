@@ -1,13 +1,20 @@
 # app/models.py
 from __future__ import annotations
-from typing import List, Dict, Optional, Literal
 from pydantic import BaseModel, Field, ConfigDict
+from typing import Optional, List, Literal,  Dict
 
 # ----------------------- Уже существующие модели -----------------------
 
+
 class IngestRequest(BaseModel):
-    project_id: str
-    src_s3_key: str  # путь к DXF в raw-plans (или имя файла в /data)
+    model_config = ConfigDict(populate_by_name=True)
+    project_id: str = Field(..., alias="projectId")
+    src_s3_key: str = Field(..., alias="srcKey")  # backend шлёт 'key' или 'srcKey' — смотри что реально приходит
+
+class ExportRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    project_id: str = Field(..., alias="projectId")
+    formats: List[Literal['PDF','DXF','PNG']] = Field(..., alias="exportFormats")
 
 
 class PlaceRequest(BaseModel):
@@ -17,12 +24,6 @@ class PlaceRequest(BaseModel):
 
 class RouteRequest(BaseModel):
     project_id: str
-
-
-class ExportRequest(BaseModel):
-    project_id: str
-    formats: List[Literal['PDF', 'DXF', 'PNG']] = ['PDF']
-
 
 # ---------- Освещение: запрос/ответ (совместимо с твоим lighting.py) ----------
 
