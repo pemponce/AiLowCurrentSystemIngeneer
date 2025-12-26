@@ -18,11 +18,13 @@ def _room_id(idx: int) -> str:
 
 
 def _room_size_hint(room: Polygon) -> float:
+    """Типичный размер комнаты (в тех же единицах, что и геометрия)."""
     a = float(abs(room.area))
     return max(1.0, math.sqrt(a))
 
 
 def _offset_inside(room: Polygon, base: Point, seg: LineString) -> Point:
+    """Сдвигаем точку вглубь комнаты относительно сегмента проёма."""
     x1, y1 = seg.coords[0]
     x2, y2 = seg.coords[-1]
     dx = x2 - x1
@@ -66,14 +68,39 @@ def _opening_seg(o: Dict[str, Any]) -> Optional[LineString]:
         return None
 
 
+def _rooms_as_polygons(project_id: str) -> List[Polygon]:
+    """Нормализуем rooms в shapely.Polygon (поддерживаем dict-формат из ingest_png)."""
+    rooms_raw = DB.get("rooms", {}).get(project_id, [])
+    out: List[Polygon] = []
+    for r in rooms_raw:
+        if isinstance(r, Polygon):
+            out.append(r)
+            continue
+        if isinstance(r, dict):
+            pts = r.get("polygon") or r.get("polygonPx") or r.get("points")
+            if not pts or not isinstance(pts, list) or len(pts) < 3:
+                continue
+            try:
+                poly = Polygon([(float(x), float(y)) for x, y in pts])
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                if poly.is_valid and poly.area > 1.0:
+                    out.append(poly)
+            except Exception:
+                continue
+    return out
+
+
 def generate_candidates(project_id: str) -> List[Candidate]:
+    """Генерация кандидатов с учётом проёмов (если они уже детектированы)."""
     rules = get_rules()
-    rooms: List[Polygon] = DB["rooms"].get(project_id, [])
+    rooms: List[Polygon] = _rooms_as_polygons(project_id)
     candidates: List[Candidate] = []
 
     for idx, room in enumerate(rooms):
         rid = _room_id(idx)
 
+        # 1) Сокеты вдоль стен
         per_meter = rules["per_room_requirements"].get("LIVING", {}).get("socket_per_wall_meter", 0.3)
         step = 1.0 / max(per_meter, 0.2)
 
@@ -89,6 +116,7 @@ def generate_candidates(project_id: str) -> List[Candidate]:
                         continue
                 candidates.append(("SOCKET", rid, p))
 
+        # 2) Выключатель возле двери, если дверь найдена
         door_openings = [o for o in openings if (o.get("kind") == "door")]
         if door_openings:
             best = None
@@ -107,13 +135,15 @@ def generate_candidates(project_id: str) -> List[Candidate]:
                 candidates.append(("SWITCH", rid, sw))
                 continue
 
-        x, y = room.exterior.coords[0]
-        candidates.append(("SWITCH", rid, Point(float(x), float(y))))
+        # fallback: центр комнаты
+        c = room.centroid
+        candidates.append(("SWITCH", rid, Point(float(c.x), float(c.y))))
 
     return candidates
 
 
 def select_devices(project_id: str, candidates: List[Candidate]):
+    """Простейший ILP: минимум устройств при базовых ограничениях."""
     model = cp_model.CpModel()
     xs = []
 
@@ -133,16 +163,17 @@ def select_devices(project_id: str, candidates: List[Candidate]):
             model.Add(sum(xs[i] for i in idxs_socket) <= 6)
 
     model.Minimize(sum(xs))
+
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 2.0
+    solver.parameters.max_time_in_seconds = float(2.0)
+    status = solver.Solve(model)
 
-    res = solver.Solve(model)
-    chosen: List[Candidate] = []
+    selected = []
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        for i, x in enumerate(xs):
+            if solver.Value(x) == 1:
+                selected.append(candidates[i])
 
-    if res in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        for i, var in enumerate(xs):
-            if solver.Value(var) == 1:
-                chosen.append(candidates[i])
-
-    DB["devices"][project_id] = chosen
-    return chosen
+    DB["devices"][project_id] = selected
+    DB["candidates"][project_id] = candidates
+    return selected
