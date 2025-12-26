@@ -1,117 +1,182 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from shapely.geometry import LineString, Polygon, shape
 
 
-DB: Dict[str, Any] = {
-    "plan_graph": {},      # project_id -> dict|None
-    "rooms": {},           # project_id -> List[Polygon]
-    "walls": {},           # project_id -> List[LineString]
-    "doors": {},           # project_id -> List[LineString]
-    "room_meta": {},       # project_id -> List[dict]
-    "devices": {},         # project_id -> List[(type, room_idx, shapely Point)]
-    "routes": {},          # project_id -> List[(type, shapely LineString, length)]
-    "candidates": {},      # project_id -> List[(type, room_idx, shapely Point)]
-    "source_meta": {},     # project_id -> {"type": "png|dxf", "local_path": str|None, "src_key": str|None}
+# In-memory DB (MVP)
+DB: Dict[str, Dict[str, Any]] = {
+    "rooms": {},
+    "devices": {},
+    "routes": {},
+    "candidates": {},
+    "structure": {},
+    "plan_graph": {},
+    "source_meta": {},
+    # иногда используются в DXF импорте/роутинге:
+    "walls": {},
+    "doors": {},
 }
 
 
-def reset_project(project_id: str) -> None:
-    DB.setdefault("plan_graph", {}).setdefault(project_id, None)
+def ensure_project(project_id: str) -> None:
     DB.setdefault("rooms", {}).setdefault(project_id, [])
-    DB.setdefault("walls", {}).setdefault(project_id, [])
-    DB.setdefault("doors", {}).setdefault(project_id, [])
-    DB.setdefault("room_meta", {}).setdefault(project_id, [])
     DB.setdefault("devices", {}).setdefault(project_id, [])
     DB.setdefault("routes", {}).setdefault(project_id, [])
     DB.setdefault("candidates", {}).setdefault(project_id, [])
-    DB.setdefault("source_meta", {}).setdefault(project_id, {"type": None, "local_path": None, "src_key": None})
-
-
-def set_source_meta(project_id: str, *, file_type: str, local_path: Optional[str], src_key: Optional[str]) -> None:
-    reset_project(project_id)
-    DB["source_meta"][project_id] = {"type": file_type, "local_path": local_path, "src_key": src_key}
-
-
-def coerce_polygon(obj: Any) -> Polygon:
-    if isinstance(obj, Polygon):
-        return obj
-    if isinstance(obj, dict):
-        if "polygon" in obj and isinstance(obj["polygon"], (list, tuple)):
-            return Polygon(obj["polygon"])
-        if "geometry" in obj:
-            return shape(obj["geometry"])
-        if "type" in obj and obj.get("type") in ("Polygon", "MultiPolygon", "GeometryCollection"):
-            return shape(obj)
-    if isinstance(obj, (list, tuple)) and len(obj) >= 3:
-        return Polygon(obj)
-    raise TypeError(f"Cannot coerce to Polygon: {type(obj)}")
-
-
-def coerce_linestring(obj: Any) -> LineString:
-    if isinstance(obj, LineString):
-        return obj
-    if isinstance(obj, dict):
-        if "polyline" in obj and isinstance(obj["polyline"], (list, tuple)):
-            return LineString(obj["polyline"])
-        if "geometry" in obj:
-            return shape(obj["geometry"])
-    if isinstance(obj, (list, tuple)) and len(obj) >= 2:
-        return LineString(obj)
-    raise TypeError(f"Cannot coerce to LineString: {type(obj)}")
-
-
-def normalize_project_geometry(project_id: str) -> None:
-    reset_project(project_id)
-
-    rooms_raw = DB.get("rooms", {}).get(project_id, [])
-    if rooms_raw and not isinstance(rooms_raw[0], Polygon):
-        DB["rooms"][project_id] = [coerce_polygon(r) for r in rooms_raw]
-
-    walls_raw = DB.get("walls", {}).get(project_id, [])
-    if walls_raw and not isinstance(walls_raw[0], LineString):
-        DB["walls"][project_id] = [coerce_linestring(w) for w in walls_raw]
-
-    doors_raw = DB.get("doors", {}).get(project_id, [])
-    if doors_raw and not isinstance(doors_raw[0], LineString):
-        DB["doors"][project_id] = [coerce_linestring(d) for d in doors_raw]
-
-
-def set_geometry(
-    project_id: str,
-    *,
-    plan_graph: Optional[Dict[str, Any]],
-    rooms: List[Any],
-    room_meta: Optional[List[Dict[str, Any]]] = None,
-    walls: Optional[List[Any]] = None,
-    doors: Optional[List[Any]] = None,
-) -> None:
-    reset_project(project_id)
-
-    DB["plan_graph"][project_id] = plan_graph
-    DB["rooms"][project_id] = [coerce_polygon(r) for r in (rooms or [])]
-    DB["room_meta"][project_id] = room_meta or []
-    DB["walls"][project_id] = [coerce_linestring(w) for w in (walls or [])]
-    DB["doors"][project_id] = [coerce_linestring(d) for d in (doors or [])]
-
-    DB["devices"][project_id] = []
-    DB["routes"][project_id] = []
-    DB["candidates"][project_id] = []
+    DB.setdefault("structure", {}).setdefault(project_id, {})
+    DB.setdefault("plan_graph", {}).setdefault(project_id, None)
+    DB.setdefault("source_meta", {}).setdefault(project_id, {})
+    DB.setdefault("walls", {}).setdefault(project_id, [])
+    DB.setdefault("doors", {}).setdefault(project_id, [])
 
 
 def load_sample_rooms(project_id: str, path: str = "../../samples/geojson/simple_apartment.geojson"):
     with open(path, "r", encoding="utf-8") as f:
         gj = json.load(f)
     rooms = [shape(feat["geometry"]) for feat in gj["features"]]
-    set_geometry(project_id, plan_graph=None, rooms=rooms, room_meta=[])
+    ensure_project(project_id)
+    DB["rooms"][project_id] = rooms
     return rooms
 
 
-def room_walls(room: Any) -> List[LineString]:
-    poly = coerce_polygon(room)
+def coerce_polygon(obj: Any) -> Optional[Polygon]:
+    """
+    Приводит разные представления комнаты к shapely.Polygon.
+
+    Поддерживаем:
+      - Polygon
+      - GeoJSON dict {"type":"Polygon","coordinates":[...]}
+      - dict с polygon / polygonPx / points: list[[x,y],...]
+      - list[[x,y],...]
+    """
+    if obj is None:
+        return None
+
+    poly: Optional[Polygon] = None
+
+    if isinstance(obj, Polygon):
+        poly = obj
+    elif isinstance(obj, dict):
+        if "type" in obj and "coordinates" in obj:
+            try:
+                poly = shape(obj)
+            except Exception:
+                return None
+        else:
+            pts = obj.get("polygon") or obj.get("polygonPx") or obj.get("points")
+            if not pts or not isinstance(pts, list) or len(pts) < 3:
+                return None
+            try:
+                poly = Polygon([(float(p[0]), float(p[1])) for p in pts])
+            except Exception:
+                return None
+    elif isinstance(obj, list):
+        if len(obj) < 3:
+            return None
+        try:
+            poly = Polygon([(float(p[0]), float(p[1])) for p in obj])
+        except Exception:
+            return None
+    else:
+        return None
+
+    if poly is None or poly.is_empty:
+        return None
+
+    # чинит самопересечения
+    try:
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+    except Exception:
+        return None
+
+    if poly.is_empty or poly.area <= 0:
+        return None
+
+    return poly
+
+
+def normalize_project_geometry(project_id: str) -> List[Polygon]:
+    """
+    Нормализует DB['rooms'][project_id] к List[Polygon] и кладёт обратно.
+    Нужно, потому что PNG-ingest может хранить комнаты как dict.
+    """
+    ensure_project(project_id)
+    rooms_raw = DB.get("rooms", {}).get(project_id, [])
+    if not rooms_raw:
+        DB["rooms"][project_id] = []
+        return []
+
+    normalized: List[Polygon] = []
+    for r in rooms_raw:
+        poly = r if isinstance(r, Polygon) else coerce_polygon(r)
+        if poly is not None:
+            normalized.append(poly)
+
+    DB["rooms"][project_id] = normalized
+    return normalized
+
+
+def set_geometry(
+    project_id: str,
+    rooms: Any = None,
+    walls: Any = None,
+    doors: Any = None,
+    source_meta: Optional[Dict[str, Any]] = None,
+    **extra: Any,
+) -> Dict[str, int]:
+    """
+    Универсальный setter, чтобы разные модули (DXF/PNG/инжестеры) могли
+    задавать геометрию через единый контракт.
+
+    Поддерживает любые лишние поля через **extra:
+      set_geometry(project_id, rooms=..., walls=..., doors=..., plan_graph=..., ...)
+    """
+    ensure_project(project_id)
+
+    if rooms is not None:
+        DB["rooms"][project_id] = rooms
+        normalize_project_geometry(project_id)
+
+    if walls is not None:
+        DB.setdefault("walls", {})[project_id] = walls
+
+    if doors is not None:
+        DB.setdefault("doors", {})[project_id] = doors
+
+    if source_meta is not None:
+        DB.setdefault("source_meta", {}).setdefault(project_id, {})
+        DB["source_meta"][project_id].update(source_meta)
+
+    # любые дополнительные project-scoped структуры
+    for k, v in extra.items():
+        if k is None:
+            continue
+        DB.setdefault(k, {})
+        try:
+            DB[k][project_id] = v
+        except Exception:
+            # если по какой-то причине k не dict — не падаем
+            pass
+
+    return {
+        "rooms": len(DB.get("rooms", {}).get(project_id, [])),
+        "walls": len(DB.get("walls", {}).get(project_id, [])),
+        "doors": len(DB.get("doors", {}).get(project_id, [])),
+    }
+
+
+def room_walls(room: Union[Polygon, dict, list]) -> List[LineString]:
+    """
+    Возвращает стены комнаты как список LineString по внешнему контуру.
+    Принимает Polygon или dict/list и приводит через coerce_polygon.
+    """
+    poly = room if isinstance(room, Polygon) else coerce_polygon(room)
+    if poly is None:
+        return []
     xs, ys = poly.exterior.coords.xy
     return [
         LineString([(xs[i], ys[i]), (xs[i + 1], ys[i + 1])])
@@ -120,8 +185,12 @@ def room_walls(room: Any) -> List[LineString]:
 
 
 def along_wall_points(wall: LineString, step: float = 1.5, offsets: float = 0.2):
-    L = wall.length
-    t = offsets
+    """
+    Генерирует точки вдоль стены через step (в тех же единицах, что и геометрия),
+    с отступом от углов offsets.
+    """
+    L = float(wall.length)
+    t = float(offsets)
     pts = []
     while t < L - offsets:
         pts.append(wall.interpolate(t))
