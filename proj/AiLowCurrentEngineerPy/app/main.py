@@ -1,46 +1,58 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, ConfigDict, AliasChoices
+from typing import Optional, List, Literal, Dict, Tuple
+import re as regex
 import os
 import os.path as osp
-import re
-from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, AliasChoices
-from starlette.middleware.cors import CORSMiddleware
-
+from app.geometry_png import ingest_png
+from app.lighting import design_lighting, LightingRequest, LightingResponse
 from app.geometry import DB
 from app.placement import generate_candidates, select_devices
 from app.routing import route_all
-from app.bom import make_bom
-from app.validate import validate_project
 from app.export_dxf import export_dxf
 from app.export_pdf import export_pdf
 from app.geometry_dxf import ingest_dxf
-from app.geometry_png import ingest_png
-from app.lighting import LightingRequest, LightingResponse, design_lighting
+from app.validator import validate_project
+from app.bom import make_bom
 from app.minio_client import upload_file, download_file, CLIENT, RAW_BUCKET, EXPORT_BUCKET
 from app.api_structure import router as structure_router
 from app.structure_detect import detect_structure
 
+app = FastAPI(title="Low-Current Planner")
+app.include_router(structure_router)
 
-# -------------------------
-# Config
-# -------------------------
-LOCAL_RAW_DIR = os.getenv("LOCAL_RAW_DIR", "/tmp/raw")
-LOCAL_DL_DIR = os.getenv("LOCAL_DL_DIR", "/tmp/downloads")
-LOCAL_EXPORT_DIR = os.getenv("LOCAL_EXPORT_DIR", "/tmp/exports")
-
+LOCAL_RAW_DIR = os.getenv("LOCAL_DOWNLOAD_DIR", "/data")
+LOCAL_DL_DIR = os.getenv("LOCAL_DOWNLOAD_DIR_INFER", "/tmp/downloads")
+LOCAL_EXPORT_DIR = "/tmp/exports"
 os.makedirs(LOCAL_RAW_DIR, exist_ok=True)
 os.makedirs(LOCAL_DL_DIR, exist_ok=True)
 os.makedirs(LOCAL_EXPORT_DIR, exist_ok=True)
 
 
-# -------------------------
-# API models (Pydantic v2)
-# -------------------------
 class APIIngestRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
     project_id: str = Field(validation_alias=AliasChoices("projectId", "project_id"))
-    src_s3_key: str = Field(validation_alias=AliasChoices("srcKey", "srcKey", "src_s3_key", "srcS3Key"))
+    src_s3_key: str = Field(
+        validation_alias=AliasChoices("srcKey", "src_key", "srcS3Key", "src_s3_key")
+    )
+
+
+class APIPlaceRequest(BaseModel):
+    project_id: str = Field(validation_alias=AliasChoices("projectId", "project_id"))
+
+
+class APIRouteRequest(BaseModel):
+    project_id: str = Field(validation_alias=AliasChoices("projectId", "project_id"))
+
+
+class APIExportRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    project_id: str = Field(validation_alias=AliasChoices("projectId", "project_id"))
+    formats: List[Literal["PDF", "DXF", "PNG"]] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("formats", "exportFormats", "export_formats"),
+    )
 
 
 class APIInferRequest(BaseModel):
@@ -48,77 +60,59 @@ class APIInferRequest(BaseModel):
     project_id: str = Field(validation_alias=AliasChoices("projectId", "project_id"))
     src_s3_key: Optional[str] = Field(
         default=None,
-        validation_alias=AliasChoices("srcKey", "src_s3_key", "srcS3Key"),
+        validation_alias=AliasChoices("srcKey", "src_key", "srcS3Key", "src_s3_key"),
     )
     preferences_text: Optional[str] = Field(
         default=None,
-        validation_alias=AliasChoices("preferencesText", "preferences_text"),
+        validation_alias=AliasChoices("preferencesText", "preferences_text", "user_preferences_text"),
     )
-    export_formats: Optional[List[str]] = Field(
-        default=None,
+    export_formats: List[Literal["PDF", "DXF", "PNG"]] = Field(
+        default_factory=list,
         validation_alias=AliasChoices("exportFormats", "export_formats"),
     )
 
 
 class PreferenceParseResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, extra="ignore")
-    per_room_target_lux: Dict[str, int] = {}
-    target_lux: Optional[int] = None
+    per_room_target_lux: Optional[Dict[str, float]] = None
+    target_lux: Optional[float] = None
+    total_fixtures_hint: Optional[int] = None
+    fixture_efficacy_lm_per_w: Optional[float] = None
     notes: Optional[str] = None
 
 
-# =======================================
-#                Helpers
-# =======================================
-
 def _strip_bucket_prefix(key: str, bucket: str) -> str:
-    """Если ключ пришёл как 'bucket/key', убрать префикс 'bucket/'."""
     if key.startswith(f"{bucket}/"):
-        return key[len(bucket) + 1:]
+        return key[len(bucket) + 1 :]
     return key
 
 
 def _download_from_raw(key: str) -> str:
-    """Скачать файл из RAW в локальную папку и вернуть локальный путь."""
-    clean_key = _strip_bucket_prefix(key, RAW_BUCKET)
-    basename = osp.basename(clean_key)
-    local_path = osp.join(LOCAL_DL_DIR, basename)
-    if not osp.exists(local_path):
+    def _try(bucket: str) -> Tuple[bool, str]:
+        clean = _strip_bucket_prefix(key, bucket)
+        basename = osp.basename(clean)
+        local = osp.join(LOCAL_DL_DIR, basename)
+        if osp.exists(local):
+            return True, local
         try:
-            download_file(RAW_BUCKET, clean_key, local_path)
+            download_file(bucket, clean, local)
+            return True, local
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"S3 download failed [{RAW_BUCKET}/{clean_key}]: {e}")
-    return local_path
+            return False, f"S3 download failed [{bucket}/{clean}]: {e}"
 
+    ok, res = _try(RAW_BUCKET)
+    if ok:
+        return res
+    ok2, res2 = _try(EXPORT_BUCKET)
+    if ok2:
+        return res2
 
-def _ensure_geometry_from_key(project_id: str, src_key: Optional[str]) -> Optional[str]:
-    """
-    Если геометрии нет — подтянуть из RAW по ключу.
-    Возвращает local_path (если png/jpg скачали) — полезно для structure_detect.
-    """
-    if DB.get("rooms", {}).get(project_id):
-        return None
-
-    if not src_key:
-        return None
-
-    local_path = _download_from_raw(src_key)
-    low = local_path.lower()
-
-    if low.endswith((".dxf", ".dwg")):
-        ingest_dxf(project_id, local_path)
-        return None
-
-    if low.endswith((".png", ".jpg", ".jpeg")):
-        ingest_png(project_id, local_path)
-        return local_path
-
-    raise HTTPException(status_code=415, detail="Unsupported file type (expected .dxf/.dwg/.png/.jpg/.jpeg)")
+    raise HTTPException(status_code=400, detail=f"{res}; fallback failed [{res2}]")
 
 
 def _ensure_structure(project_id: str, src_key: Optional[str], local_path: Optional[str]) -> None:
-    """Если structure/plan_graph ещё нет — попытаться детектировать из PNG/JPG."""
     if DB.get("structure", {}).get(project_id) and DB.get("plan_graph", {}).get(project_id):
+        return
+    if not src_key and not local_path:
         return
 
     lp = None
@@ -138,61 +132,54 @@ def _ensure_structure(project_id: str, src_key: Optional[str], local_path: Optio
         return
 
     try:
-        detect_structure(project_id, lp, src_key=src_key, debug=True)
+        detect_structure(project_id, lp, src_key=src_key)
     except Exception:
-        # Не блокируем infer: placement/routing имеют fallback.
         return
 
 
 def _parse_preferences(text: Optional[str]) -> PreferenceParseResponse:
-    """
-    Простой парсер строк вида:
-    'кухня 500 лк, гостиная 300 лк'
-    """
     resp = PreferenceParseResponse(per_room_target_lux={})
     if not text:
-        resp.notes = "preferencesText is empty"
+        resp.notes = "preferences_text is empty"
         return resp
 
-    pattern = re.compile(
+    pattern = regex.compile(
         r"([A-Za-zА-Яа-яЁё0-9 _\-]+?)\s*[:\-]?\s*(\d+)\s*(?:лк|lx|lux)\b",
-        flags=re.IGNORECASE,
+        regex.IGNORECASE,
     )
-
-    for m in pattern.finditer(text):
-        name = m.group(1).strip().lower()
-        val = int(m.group(2))
-        resp.per_room_target_lux[name] = val
-
-    m2 = re.search(r"(\d+)\s*(?:лк|lx|lux)\b", text, flags=re.IGNORECASE)
-    if m2:
-        resp.target_lux = int(m2.group(1))
+    for name, val in pattern.findall(text):
+        room = name.strip().lower()
+        try:
+            lux = float(val)
+            resp.per_room_target_lux[room] = lux  # type: ignore[index]
+        except Exception:
+            pass
 
     if not resp.per_room_target_lux:
-        resp.notes = "No per-room lux found (expected 'кухня 500 лк, ...')."
+        only_num = regex.search(r"\b(\d+)\s*(?:лк|lx|lux)\b", text, flags=regex.IGNORECASE)
+        if only_num:
+            resp.target_lux = float(only_num.group(1))
+
+    if not resp.per_room_target_lux and not resp.target_lux:
+        resp.notes = "Could not parse lux targets"
     return resp
 
 
-# =======================================
-#                App
-# =======================================
+def _ensure_geometry_from_key(project_id: str, src_key: Optional[str]) -> None:
+    if DB.get("rooms", {}).get(project_id):
+        return
+    if not src_key:
+        return
 
-app = FastAPI(title="AiLowCurrentEngineerPy", version="0.1")
+    local_path = _download_from_raw(src_key)
+    low = local_path.lower()
+    if low.endswith((".dxf", ".dwg")):
+        ingest_dxf(project_id, local_path)
+    elif low.endswith((".png", ".jpg", ".jpeg")):
+        ingest_png(project_id, local_path)
+    else:
+        raise HTTPException(status_code=415, detail="Unsupported file type (expected .dxf/.dwg/.png/.jpg/.jpeg)")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Роутер структуры
-app.include_router(structure_router)
-
-
-# =======================================
-#                Routes
-# =======================================
 
 @app.get("/health", tags=["health"])
 def health():
@@ -249,6 +236,52 @@ async def lighting(req: LightingRequest) -> LightingResponse:
     return design_lighting(req)
 
 
+@app.post("/place")
+async def place(req: APIPlaceRequest):
+    cands = generate_candidates(req.project_id)
+    chosen = select_devices(req.project_id, cands)
+    violations = validate_project(req.project_id)
+    return {"project_id": req.project_id, "devices": len(chosen), "violations": violations}
+
+
+@app.post("/route")
+async def route(req: APIRouteRequest):
+    routes = route_all(req.project_id)
+    total = sum(l for _, _, l in routes)
+    bom = make_bom(req.project_id)
+    return {"project_id": req.project_id, "routes": len(routes), "length_sum": total, "bom": bom}
+
+
+@app.post("/export")
+async def export(req: APIExportRequest):
+    rooms = DB["rooms"].get(req.project_id, [])
+    devices = DB["devices"].get(req.project_id, [])
+    routes = DB["routes"].get(req.project_id, [])
+
+    out_paths: List[str] = []
+
+    if "DXF" in req.formats:
+        dxf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.dxf"
+        export_dxf(req.project_id, rooms, devices, routes, dxf_path)
+        out_paths.append(dxf_path)
+
+    if "PDF" in req.formats:
+        pdf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.pdf"
+        export_pdf(req.project_id, rooms, devices, routes, pdf_path)
+        out_paths.append(pdf_path)
+
+    uploaded: List[str] = []
+    for p in out_paths:
+        key = f"drawings/{osp.basename(p)}"
+        try:
+            uri = upload_file(EXPORT_BUCKET, p, key)
+            uploaded.append(uri)
+        except Exception as e:
+            uploaded.append(f"ERROR:{e}")
+
+    return {"project_id": req.project_id, "files": out_paths, "uploaded": uploaded}
+
+
 @app.post("/infer")
 async def infer(req: APIInferRequest):
     DB.setdefault("rooms", {}).setdefault(req.project_id, [])
@@ -256,25 +289,20 @@ async def infer(req: APIInferRequest):
     DB.setdefault("routes", {}).setdefault(req.project_id, [])
     DB.setdefault("candidates", {}).setdefault(req.project_id, [])
 
-    # 1) Если нет помещений — попробуем авто-инжест из RAW
-    local_path = _ensure_geometry_from_key(req.project_id, req.src_s3_key)
+    _ensure_geometry_from_key(req.project_id, req.src_s3_key)
+    _ensure_structure(req.project_id, req.src_s3_key, None)
 
     if not DB["rooms"].get(req.project_id):
         raise HTTPException(
             status_code=400,
-            detail="Нет геометрии помещений. Передай srcKey в /infer или сначала вызови /ingest.",
+            detail="Нет геометрии помещений. Передай srcKey в /infer или сначала вызови /ingest с srcKey=путём в RAW.",
         )
 
-    # 2) Детект структуры (стены/проёмы) — чтобы placement/routing работали точнее
-    _ensure_structure(req.project_id, req.src_s3_key, local_path)
-
-    # 3) Разобрать предпочтения
     parsed = _parse_preferences(req.preferences_text)
 
-    # 4) Освещение
-    lighting_summary: Dict[str, Any] = {}
+    lighting_summary = {}
     try:
-        kwargs: Dict[str, Any] = {"project_id": req.project_id}
+        kwargs = {"project_id": req.project_id}
         if parsed.per_room_target_lux:
             kwargs["per_room_target_lux"] = parsed.per_room_target_lux
         if parsed.target_lux:
@@ -282,25 +310,16 @@ async def infer(req: APIInferRequest):
 
         lr = LightingRequest(**kwargs)  # type: ignore[arg-type]
         lighting_resp = design_lighting(lr)
-        lighting_summary = lighting_resp.model_dump()
+        lighting_summary = lighting_resp.model_dump() if isinstance(lighting_resp, BaseModel) else lighting_resp
     except Exception:
         rooms = DB["rooms"].get(req.project_id, [])
-        lighting_summary = {"rooms_count": len(rooms), "note": "LightingResponse не сформирован (fallback)."}
+        lighting_summary = {"rooms_count": len(rooms), "note": "LightingResponse не сформирован — вернулась сводка."}
 
-    # 5) Расстановка и трассировка
     cands = generate_candidates(req.project_id)
-    _ = select_devices(req.project_id, cands)
+    _ = select_devices(req.project_id, cands)  # <-- КРИТИЧНО: candidates передаем
     routes = route_all(req.project_id)
     _ = validate_project(req.project_id)
 
-    # 6) BOM
-    bom = {}
-    try:
-        bom = make_bom(req.project_id)
-    except Exception:
-        bom = {}
-
-    # 7) Экспорт
     wants = set(req.export_formats or [])
     exported_files: List[str] = []
     uploaded_uris: List[str] = []
@@ -328,7 +347,6 @@ async def infer(req: APIInferRequest):
         "parsed": parsed.model_dump(),
         "lighting_summary": lighting_summary,
         "routes_count": len(routes),
-        "bom": bom,
         "exported_files": exported_files,
         "uploaded_uris": uploaded_uris,
     }

@@ -5,11 +5,11 @@ import os.path as osp
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field, ConfigDict, AliasChoices
 
 from app.geometry import DB
-from app.geometry_dxf import ingest_dxf
 from app.geometry_png import ingest_png
+from app.geometry_dxf import ingest_dxf
 from app.minio_client import RAW_BUCKET, download_file
 from app.structure_detect import detect_structure
 
@@ -21,12 +21,14 @@ os.makedirs(LOCAL_DL_DIR, exist_ok=True)
 
 class APIDetectStructureRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
     project_id: str = Field(validation_alias=AliasChoices("projectId", "project_id"))
     src_s3_key: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("srcKey", "src_key", "srcS3Key", "src_s3_key"),
     )
-    debug: bool = Field(default=True)
+    # чтобы ты мог дергать /detect-structure с debug=true без 500
+    debug: bool = Field(default=False, validation_alias=AliasChoices("debug"))
 
 
 def _strip_bucket_prefix(key: str, bucket: str) -> str:
@@ -47,6 +49,7 @@ def _download_from_raw(src_key: str) -> str:
 
 
 def _ensure_rooms(project_id: str, src_key: Optional[str]) -> Optional[str]:
+    """Гарантируем наличие DB['rooms'][project_id]. Возвращаем local image path (если есть)."""
     DB.setdefault("rooms", {}).setdefault(project_id, [])
     DB.setdefault("devices", {}).setdefault(project_id, [])
     DB.setdefault("routes", {}).setdefault(project_id, [])
@@ -88,6 +91,11 @@ async def detect_structure_endpoint(req: APIDetectStructureRequest):
         local_image = _download_from_raw(req.src_s3_key)
 
     try:
-        return detect_structure(req.project_id, local_image, src_key=req.src_s3_key, debug=req.debug)
+        return detect_structure(
+            req.project_id,
+            local_image,
+            src_key=req.src_s3_key,
+            debug=req.debug,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Structure detection failed: {e}")
