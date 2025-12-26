@@ -26,13 +26,19 @@ public class ProjectController {
     private final ProjectService projects;
     private final WebClient webClient;
 
+
+    @PostMapping
+    public ResponseEntity<CreateProjectResponse> create(@RequestBody String name) {
+        Project p = projects.create(name);
+        return ResponseEntity.ok(new CreateProjectResponse(p.getId().toString(), p.getName()));
+    }
+
     @PostMapping("/{id}/upload")
     public ResponseEntity<UploadResponse> uploadByUrl(
             @PathVariable String id,
             @RequestBody Map<String, String> body) throws Exception {
 
-        long pid = Long.parseLong(id); // ВАЖНО: не Long.getLong!
-
+        long pid = Long.parseLong(id);
         String pngUrl = body.get("pngUrl");
 
         byte[] data = webClient.get()
@@ -41,11 +47,8 @@ public class ProjectController {
                 .bodyToMono(byte[].class)
                 .block();
 
-        String key = "raw-plans/" + id + "/" + UUID.randomUUID() + ".png";
-        try (var in = new java.io.ByteArrayInputStream(data)) {
-            // лучше складывать в RAW bucket, а не EXPORTS:
-            s3.uploadRawBytes(key, data, "image/png");
-        }
+        String key = id + "/" + UUID.randomUUID() + ".png";
+        s3.uploadRawBytes(key, data, "image/png"); // <— этот метод должен класть в бакет raw-plans
 
         projects.setSrcKey(pid, key);
         planner.ingest(id, key);
@@ -53,19 +56,37 @@ public class ProjectController {
         return ResponseEntity.ok(new UploadResponse(id, key));
     }
     @PostMapping("/{id}/infer")
-    public ResponseEntity<?> runInfer(@PathVariable String id, @RequestBody Map<String,Object> body){
-        var req = new PlannerDtos.RunJobRequest(
-                id,
-                (String) body.getOrDefault("preferencesText", ""),
-                (Integer) body.get("totalFixtures"),
-                (Double) body.get("targetLux"),
-                (Double) body.get("efficacyLmPerW"),
-                (Double) body.get("maintenanceFactor"),
-                (Double) body.get("utilizationFactor"),
-                (java.util.List<String>) body.get("exportFormats")
+    public PlannerDtos.InferResponse runInfer(
+            @PathVariable String id,
+            @RequestBody PlannerDtos.RunJobRequest req) {
+
+        // projectId берём ИЗ PATH, а не из тела
+        String projectId = id;
+
+        // если в теле нет srcKey — возьми из БД (мы же его туда положили при upload)
+        String srcKey = (req.srcKey() == null || req.srcKey().isBlank())
+                ? projects.findById(Long.parseLong(id)).getSrcKey()
+                : req.srcKey();
+
+        // Принудительно прогоняем /ingest (мало ли гонки/старые данные)
+        if (srcKey != null && !srcKey.isBlank()) {
+            planner.ingest(projectId, srcKey);
+        }
+
+        // Собираем новый запрос с гарантированными полями
+        PlannerDtos.RunJobRequest fixed = new PlannerDtos.RunJobRequest(
+                projectId,
+                srcKey,
+                req.preferencesText(),
+                req.exportFormats(),
+                req.totalFixtures(),
+                req.targetLux(),
+                req.efficacyLmPerW(),
+                req.maintenanceFactor(),
+                req.utilizationFactor()
         );
-        var result = planner.infer(req);
-        return ResponseEntity.ok(result);
+
+        return planner.infer(fixed);
     }
 
 }

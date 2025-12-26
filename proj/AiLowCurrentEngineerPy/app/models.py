@@ -7,9 +7,9 @@ from typing import Optional, List, Literal,  Dict
 
 
 class IngestRequest(BaseModel):
+    project_id: str = Field(alias='projectId')
+    src_s3_key: str = Field(alias='srcKey')
     model_config = ConfigDict(populate_by_name=True)
-    project_id: str = Field(..., alias="projectId")
-    src_s3_key: str = Field(..., alias="srcKey")  # backend шлёт 'key' или 'srcKey' — смотри что реально приходит
 
 class ExportRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -139,23 +139,23 @@ class ProjectCreateResponse(BaseModel):
     upload_url: Optional[str] = None
 
 
+# app/models.py (добавь поле)
 class InferRequest(BaseModel):
-    """
-    Единая точка входа из UI: пользователь загрузил DXF/DWG и написал пожелания.
-    """
-    project_id: str
-    user_preferences_text: str
-    default_total_fixtures: int = 20
-    default_target_lux: float = 300.0
-    fixture_efficacy_lm_per_w: float = 110.0
-    maintenance_factor: float = 0.8
-    utilization_factor: float = 0.6
-    export_formats: List[Literal['PDF','DXF','PNG']] = ['PDF']
+    project_id: str = Field(..., alias="projectId")
+    src_key: Optional[str] = Field(None, alias="srcKey")
+    preferences_text: Optional[str] = Field(None, alias="preferencesText")
+    export_formats: List[str] = Field(default_factory=list, alias="exportFormats")
+
+    class Config:
+        populate_by_name = True  # принимать и camelCase, и snake_case
 
 
 class InferResponse(BaseModel):
-    project_id: str
-    parsed: PreferenceParseResponse
-    lighting: LightingResponse
-    exported_files: List[str] = []
-    uploaded_uris: List[str] = []
+    job_id: str = Field(..., alias="jobId")
+    status: Literal["queued", "running", "done", "failed"]
+    pdf_key: Optional[str] = Field(None, alias="pdfKey")
+    dxf_key: Optional[str] = Field(None, alias="dxfKey")
+    message: Optional[str] = None
+
+    class Config:
+        populate_by_name = True

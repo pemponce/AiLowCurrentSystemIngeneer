@@ -57,8 +57,8 @@ public class JobService {
       j.setStatus(Job.Status.DONE);
       j.setParsedJson(writeJson(infer.parsed()));
       j.setLightingJson(writeJson(infer.lighting()));
-      j.setExportedFilesJson(writeJson(infer.exported_files()));
-      j.setUploadedUrisJson(writeJson(infer.uploaded_uris()));
+      j.setExportedFilesJson(writeJson(infer.exportedFiles()));
+      j.setUploadedUrisJson(writeJson(infer.uploadedUris()));
     } catch (Exception e) {
       j.setStatus(Job.Status.ERROR);
       j.setErrorText(e.getMessage());
