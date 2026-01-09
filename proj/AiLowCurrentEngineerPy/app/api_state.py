@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.geometry import DB
+from app.artifacts_index import build_artifacts_index
 
 router = APIRouter(tags=["State"])
 
@@ -97,10 +98,14 @@ class ProjectStateResponse(BaseModel):
     devices: list[dict[str, Any]] = Field(default_factory=list)
     routes: list[dict[str, Any]] = Field(default_factory=list)
     exports: dict = Field(default_factory=dict)
+    artifacts: dict = Field(default_factory=dict, description="Unified artifacts index (key/url)")
 
 
 @router.get("/state/{project_id}", response_model=ProjectStateResponse)
-def get_state(project_id: str):
+def get_state(
+    project_id: str,
+    expiresSeconds: int = Query(3600, ge=60, le=7 * 24 * 3600),
+):
     if (
         project_id not in DB.get("rooms", {})
         and project_id not in DB.get("source_meta", {})
@@ -109,6 +114,8 @@ def get_state(project_id: str):
         raise HTTPException(status_code=404, detail=f"Unknown projectId: {project_id}")
 
     exports = DB.get("exports", {}).get(project_id, {})
+
+    artifacts = build_artifacts_index(project_id, expires_seconds=int(expiresSeconds))
 
     rooms = DB.get("rooms", {}).get(project_id, [])
     devices_raw = DB.get("devices", {}).get(project_id, [])
@@ -129,4 +136,5 @@ def get_state(project_id: str):
         devices=devices,
         routes=routes,
         exports=exports,
+        artifacts=artifacts,
     )

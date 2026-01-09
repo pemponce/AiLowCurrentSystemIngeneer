@@ -285,3 +285,133 @@ def export_preview_png(
     if not ok:
         raise RuntimeError(f"Cannot write preview png: {out_path}")
     return out_path
+
+
+def export_preview_canvas_png(
+    *,
+    rooms: Any,
+    devices: Any,
+    routes: Any,
+    out_path: str,
+    canvas_size: int = 1400,
+    pad: int = 40,
+    room_label_prefix: str = "room",
+) -> str:
+    """Рендерит preview на белом холсте, когда исходного изображения нет (например, DXF).
+
+    Координаты могут быть в "world" единицах DXF. Мы приводим их к пикселям
+    через affine-преобразование по bounds всех геометрий.
+    """
+
+    # --- Collect bounds ---
+    pts_all: List[Tuple[float, float]] = []
+
+    rooms_list = []
+    if rooms is None:
+        rooms_list = []
+    elif isinstance(rooms, dict) and "rooms" in rooms:
+        rooms_list = rooms["rooms"]
+    else:
+        rooms_list = rooms if isinstance(rooms, (list, tuple)) else [rooms]
+
+    for room in rooms_list:
+        coords = _poly_coords(room)
+        for x, y in coords:
+            pts_all.append((float(x), float(y)))
+
+    for poly in _iter_routes(routes):
+        for x, y in poly:
+            pts_all.append((float(x), float(y)))
+
+    for _, _, (x, y) in _iter_devices(devices):
+        pts_all.append((float(x), float(y)))
+
+    # empty -> blank canvas
+    img = np.full((canvas_size, canvas_size, 3), 255, dtype=np.uint8)
+    overlay = img.copy()
+
+    if not pts_all:
+        ok = cv2.imwrite(out_path, img)
+        if not ok:
+            raise RuntimeError(f"Cannot write preview png: {out_path}")
+        return out_path
+
+    xs = [p[0] for p in pts_all]
+    ys = [p[1] for p in pts_all]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+
+    w = max(maxx - minx, 1e-6)
+    h = max(maxy - miny, 1e-6)
+    usable = max(canvas_size - 2 * pad, 1)
+    s = usable / max(w, h)
+
+    def tx(x: float, y: float) -> Tuple[int, int]:
+        X = (x - minx) * s + pad
+        Y = (y - miny) * s + pad
+        return int(round(X)), int(round(Y))
+
+    # --- Rooms ---
+    for idx, room in enumerate(rooms_list):
+        coords = _poly_coords(room)
+        if len(coords) < 3:
+            continue
+        pts = np.array([tx(x, y) for x, y in coords], dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(overlay, [pts], isClosed=True, color=(0, 255, 255), thickness=2)
+
+        # label
+        xs0 = [p[0] for p in coords]
+        ys0 = [p[1] for p in coords]
+        cxw = float(sum(xs0) / max(len(xs0), 1))
+        cyw = float(sum(ys0) / max(len(ys0), 1))
+        cx, cy = tx(cxw, cyw)
+
+        rid = ""
+        if isinstance(room, dict):
+            rid = str(room.get("id") or room.get("roomId") or room.get("name") or "")
+        if not rid:
+            rid = f"{room_label_prefix}_{idx:03d}"
+
+        cx = max(5, min(canvas_size - 5, cx))
+        cy = max(15, min(canvas_size - 5, cy))
+        cv2.putText(
+            overlay,
+            rid,
+            (cx, cy),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 200, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    # --- Routes ---
+    for poly in _iter_routes(routes):
+        if len(poly) < 2:
+            continue
+        pts = np.array([tx(x, y) for x, y in poly], dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(overlay, [pts], isClosed=False, color=(255, 0, 255), thickness=2)
+
+    # --- Devices ---
+    for dtype, room_id, (x, y) in _iter_devices(devices):
+        px, py = tx(float(x), float(y))
+        if px < 0 or py < 0 or px >= canvas_size or py >= canvas_size:
+            continue
+        cv2.circle(overlay, (px, py), 6, (0, 0, 255), -1)
+        label = dtype if not room_id else f"{dtype}:{room_id}"
+        cv2.putText(
+            overlay,
+            label,
+            (min(canvas_size - 5, px + 10), min(canvas_size - 5, py + 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    out = cv2.addWeighted(overlay, 0.85, img, 0.15, 0)
+    ok = cv2.imwrite(out_path, out)
+    if not ok:
+        raise RuntimeError(f"Cannot write preview png: {out_path}")
+    return out_path

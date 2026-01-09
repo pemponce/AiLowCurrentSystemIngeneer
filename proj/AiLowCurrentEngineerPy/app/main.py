@@ -7,9 +7,10 @@ import re as regex
 import os
 import os.path as osp
 import json
+import logging
 
 from app.geometry_png import ingest_png
-from app.export_preview_png import export_preview_png
+from app.export_preview_png import export_preview_png, export_preview_canvas_png
 from app.lighting import design_lighting, LightingRequest, LightingResponse
 from app.geometry import DB
 from app.placement import generate_candidates, select_devices
@@ -25,6 +26,7 @@ from app.api_structure import router as structure_router
 from app.api_artifacts import router as artifacts_router
 from app.api_state import router as state_router
 from app.structure_detect import detect_structure
+from app.artifacts_index import build_artifacts_index, build_artifacts_manifest
 
 app = FastAPI(title="Low-Current Planner")
 app.include_router(structure_router)
@@ -37,6 +39,24 @@ LOCAL_EXPORT_DIR = "/tmp/exports"
 os.makedirs(LOCAL_RAW_DIR, exist_ok=True)
 os.makedirs(LOCAL_DL_DIR, exist_ok=True)
 os.makedirs(LOCAL_EXPORT_DIR, exist_ok=True)
+
+
+# ---------------------------
+# Logging / diagnostic mode
+# ---------------------------
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logger = logging.getLogger("planner")
+
+
+def _artifact_ttl_seconds() -> int:
+    """TTL (seconds) for presigned artifact URLs returned by API."""
+    try:
+        v = int(os.getenv("ARTIFACT_URL_TTL", "3600"))
+        return v if v > 0 else 3600
+    except Exception:
+        return 3600
 
 
 # ---------------------------
@@ -186,7 +206,7 @@ def _download_from_raw(key: str) -> str:
 
 def _ensure_png_path(local_path: str) -> str:
     """
-    export_preview_png ожидает PNG (по комменту). Если пришел JPG/JPEG — попробуем конвертировать.
+    export_preview_png ожидает PNG. Если пришел JPG/JPEG — попробуем конвертировать.
     Если Pillow не установлен или конвертация не удалась — вернем исходный путь.
     """
     low = (local_path or "").lower()
@@ -292,7 +312,7 @@ def _parse_preferences(text: Optional[str]) -> PreferenceParseResponse:
         return resp
 
     pattern = regex.compile(
-        r"([A-Za-zА-Яа-яЁё0-9 _\-]+?)\s*[:\-]?\s*(\d+)\s*(?:лк|lx|lux)\b",
+        r"([A-Za-zА-Яа-яЁё0-9 _\\-]+?)\\s*[:\\-]?\\s*(\\d+)\\s*(?:лк|lx|lux)\\b",
         regex.IGNORECASE,
     )
     for name, val in pattern.findall(text):
@@ -304,7 +324,7 @@ def _parse_preferences(text: Optional[str]) -> PreferenceParseResponse:
             pass
 
     if not resp.per_room_target_lux:
-        only_num = regex.search(r"\b(\d+)\s*(?:лк|lx|lux)\b", text, flags=regex.IGNORECASE)
+        only_num = regex.search(r"\\b(\\d+)\\s*(?:лк|lx|lux)\\b", text, flags=regex.IGNORECASE)
         if only_num:
             resp.target_lux = float(only_num.group(1))
 
@@ -334,19 +354,33 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/plan-graph/{project_id}")
-def get_plan_graph(project_id: str):
-    pg = DB.get("plan_graph", {}).get(project_id)
-    if not pg:
-        raise HTTPException(status_code=404, detail="plan_graph not found (run /detect-structure first)")
-    return pg
-
-
 @app.get("/health/s3")
 def health_s3():
     try:
         ok = CLIENT.bucket_exists(RAW_BUCKET)
-        return {"ok": ok, "endpoint": os.getenv("S3_ENDPOINTPY"), "raw_bucket": RAW_BUCKET}
+        internal = os.getenv("S3_ENDPOINTPY", "minio:9000")
+        public = (
+            os.getenv("S3_PUBLIC_ENDPOINT")
+            or os.getenv("S3_PUBLIC_ENDPOINTPY")
+            or internal
+        )
+
+        warning = None
+        if (
+            ("minio" in str(public).lower())
+            and not os.getenv("S3_PUBLIC_ENDPOINT")
+            and not os.getenv("S3_PUBLIC_ENDPOINTPY")
+        ):
+            warning = "S3_PUBLIC_ENDPOINT is not set; presigned URLs may use internal host (e.g., minio:9000) and may not open in browser. Set S3_PUBLIC_ENDPOINT=localhost:9000 for local dev."
+
+        return {
+            "ok": ok,
+            "raw_bucket": RAW_BUCKET,
+            "export_bucket": EXPORT_BUCKET,
+            "endpoint_internal": internal,
+            "endpoint_public": public,
+            "warning": warning,
+        }
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -383,11 +417,6 @@ async def ingest(req: APIIngestRequest):
     return {"project_id": req.project_id, **stats}
 
 
-@app.post("/lighting", response_model=LightingResponse)
-async def lighting(req: LightingRequest) -> LightingResponse:
-    return design_lighting(req)
-
-
 @app.post("/place")
 async def place(req: APIPlaceRequest):
     cands = generate_candidates(req.project_id)
@@ -415,127 +444,131 @@ async def route(req: APIRouteRequest):
 
 @app.post("/export")
 async def export(req: APIExportRequest):
-    rooms = DB.get("rooms", {}).get(req.project_id, [])
-    devices = _devices_to_json(DB.get("devices", {}).get(req.project_id, []))
-    routes = DB.get("routes", {}).get(req.project_id, [])
-    DB["devices"][req.project_id] = devices  # normalize
+    try:
+        rooms = DB.get("rooms", {}).get(req.project_id, [])
+        devices = _devices_to_json(DB.get("devices", {}).get(req.project_id, []))
+        routes = DB.get("routes", {}).get(req.project_id, [])
+        DB["devices"][req.project_id] = devices  # normalize
 
-    out_paths: List[str] = []
-    uploaded: List[str] = []
-    keys: List[str] = []
+        out_paths: List[str] = []
+        uploaded: List[str] = []
+        keys: List[str] = []
 
-    if "DXF" in req.formats:
-        dxf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.dxf"
-        export_dxf(req.project_id, rooms, devices, routes, dxf_path)
-        out_paths.append(dxf_path)
+        if "DXF" in req.formats:
+            dxf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.dxf"
+            export_dxf(req.project_id, rooms, devices, routes, dxf_path)
+            out_paths.append(dxf_path)
 
-    if "PDF" in req.formats:
-        pdf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.pdf"
-        export_pdf(req.project_id, rooms, devices, routes, pdf_path)
-        out_paths.append(pdf_path)
+        if "PDF" in req.formats:
+            pdf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.pdf"
+            export_pdf(req.project_id, rooms, devices, routes, pdf_path)
+            out_paths.append(pdf_path)
 
-    for p in out_paths:
-        key = f"drawings/{osp.basename(p)}"
-        try:
-            uri = upload_file(EXPORT_BUCKET, p, key)
-            uploaded.append(uri)
-            keys.append(key)
-        except Exception as e:
-            uploaded.append(f"ERROR:{e}")
+        for p in out_paths:
+            key = f"drawings/{osp.basename(p)}"
+            try:
+                uri = upload_file(EXPORT_BUCKET, p, key)
+                uploaded.append(uri)
+                keys.append(key)
+            except Exception as e:
+                uploaded.append(f"ERROR:{e}")
 
-    DB.setdefault("exports", {}).setdefault(req.project_id, {})
-    DB["exports"][req.project_id].update({"files": out_paths, "uploaded_uris": uploaded, "keys": keys})
+        DB.setdefault("exports", {}).setdefault(req.project_id, {})
+        DB["exports"][req.project_id].update({"files": out_paths, "uploaded_uris": uploaded, "keys": keys})
 
-    return {"project_id": req.project_id, "files": out_paths, "uploaded": uploaded, "keys": keys}
+        ttl = _artifact_ttl_seconds()
+        artifacts = build_artifacts_index(req.project_id, expires_seconds=ttl)
+
+        return {
+            "project_id": req.project_id,
+            "files": out_paths,
+            "uploaded": uploaded,
+            "keys": keys,
+            "artifacts": artifacts,
+            "expiresSeconds": ttl,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("export failed project_id=%s", getattr(req, "project_id", None))
+        raise HTTPException(status_code=500, detail=f"Export failed: {type(e).__name__}: {e}")
 
 
 @app.post("/infer")
 async def infer(req: APIInferRequest):
-    DB.setdefault("rooms", {}).setdefault(req.project_id, [])
-    DB.setdefault("devices", {}).setdefault(req.project_id, [])
-    DB.setdefault("routes", {}).setdefault(req.project_id, [])
-    DB.setdefault("candidates", {}).setdefault(req.project_id, [])
-    DB.setdefault("exports", {}).setdefault(req.project_id, {})
-    DB.setdefault("source", {}).setdefault(req.project_id, {})
+    try:
+        DB.setdefault("rooms", {}).setdefault(req.project_id, [])
+        DB.setdefault("devices", {}).setdefault(req.project_id, [])
+        DB.setdefault("routes", {}).setdefault(req.project_id, [])
+        DB.setdefault("candidates", {}).setdefault(req.project_id, [])
+        DB.setdefault("exports", {}).setdefault(req.project_id, {})
+        DB.setdefault("source", {}).setdefault(req.project_id, {})
 
-    if req.src_s3_key:
-        DB["source"][req.project_id] = {"src_key": req.src_s3_key}
+        if req.src_s3_key:
+            DB["source"][req.project_id] = {"src_key": req.src_s3_key}
 
-    _ensure_geometry_from_key(req.project_id, req.src_s3_key)
-    _ensure_structure(req.project_id, req.src_s3_key, None)
+        _ensure_geometry_from_key(req.project_id, req.src_s3_key)
+        _ensure_structure(req.project_id, req.src_s3_key, None)
 
-    if not DB.get("rooms", {}).get(req.project_id):
-        raise HTTPException(
-            status_code=400,
-            detail="Нет геометрии помещений. Передай srcKey в /infer или сначала вызови /ingest.",
+        if not DB.get("rooms", {}).get(req.project_id):
+            raise HTTPException(
+                status_code=400,
+                detail="Нет геометрии помещений. Передай srcKey в /infer или сначала вызови /ingest.",
+            )
+
+        # placement + routing
+        cands = generate_candidates(req.project_id)
+        chosen = select_devices(req.project_id, cands)
+        DB["devices"][req.project_id] = _devices_to_json(
+            chosen if isinstance(chosen, list) else DB["devices"].get(req.project_id, [])
         )
 
-    parsed = _parse_preferences(req.preferences_text)
+        routes_raw = route_all(req.project_id)
+        routes_json = _routes_to_json(routes_raw)
+        DB["routes"][req.project_id] = routes_json
 
-    lighting_summary: dict = {}
-    try:
-        kwargs = {"project_id": req.project_id}
-        if parsed.per_room_target_lux:
-            kwargs["per_room_target_lux"] = parsed.per_room_target_lux
-        if parsed.target_lux:
-            kwargs["target_lux"] = parsed.target_lux
+        violations = validate_project(req.project_id)
+        bom = make_bom(req.project_id)
 
-        lr = LightingRequest(**kwargs)  # type: ignore[arg-type]
-        lighting_resp = design_lighting(lr)
-        lighting_summary = lighting_resp.model_dump() if isinstance(lighting_resp, BaseModel) else lighting_resp
-    except Exception:
-        rooms = DB.get("rooms", {}).get(req.project_id, [])
-        lighting_summary = {"rooms_count": len(rooms), "note": "LightingResponse не сформирован — вернулась сводка."}
+        wants = set([str(x).upper() for x in (req.export_formats or [])])
+        exported_files: List[str] = []
+        uploaded_uris: List[str] = []
+        exported_keys: List[str] = []
 
-    # placement
-    cands = generate_candidates(req.project_id)
-    chosen = select_devices(req.project_id, cands)
-    DB["devices"][req.project_id] = _devices_to_json(
-        chosen if isinstance(chosen, list) else DB["devices"].get(req.project_id, [])
-    )
+        rooms_json = DB.get("rooms", {}).get(req.project_id, [])
+        devices_json = DB.get("devices", {}).get(req.project_id, [])
+        routes_json = DB.get("routes", {}).get(req.project_id, [])
 
-    # routing
-    routes_raw = route_all(req.project_id)
-    routes_json = _routes_to_json(routes_raw)
-    DB["routes"][req.project_id] = routes_json
+        # Determine source image path once
+        src_key = req.src_s3_key or (DB.get("source", {}).get(req.project_id) or {}).get("src_key")
+        local_src_png_path: Optional[str] = None
+        if src_key:
+            try:
+                local_src_path = _download_from_raw(src_key)
+                local_src_png_path = _ensure_png_path(local_src_path)
+            except Exception:
+                local_src_png_path = None
 
-    violations = validate_project(req.project_id)
-
-    wants = set([str(x).upper() for x in (req.export_formats or [])])
-    exported_files: List[str] = []
-    uploaded_uris: List[str] = []
-    exported_keys: List[str] = []
-
-    rooms_json = DB.get("rooms", {}).get(req.project_id, [])
-    devices_json = DB.get("devices", {}).get(req.project_id, [])
-    routes_json = DB.get("routes", {}).get(req.project_id, [])
-
-    # Determine source image path once (used for preview + optional overlay)
-    src_key = req.src_s3_key
-    if not src_key:
-        src_key = (DB.get("source", {}).get(req.project_id) or {}).get("src_key")
-    local_src_path: Optional[str] = None
-    local_src_png_path: Optional[str] = None
-    if src_key:
-        try:
-            local_src_path = _download_from_raw(src_key)
-            local_src_png_path = _ensure_png_path(local_src_path)
-        except Exception:
-            local_src_path = None
-            local_src_png_path = None
-
-    # --- PREVIEW PNG (ALWAYS if base image available) ---
-    preview_key: Optional[str] = None
-    if local_src_png_path and osp.exists(local_src_png_path):
+        # --- PREVIEW PNG (ALWAYS) ---
+        preview_key: Optional[str] = None
         try:
             preview_path = f"/tmp/preview_{req.project_id}.png"
-            export_preview_png(
-                base_image_path=local_src_png_path,
-                rooms=DB["rooms"][req.project_id],
-                devices=DB["devices"][req.project_id],
-                routes=DB["routes"][req.project_id],
-                out_path=preview_path,
-            )
+            if local_src_png_path and osp.exists(local_src_png_path):
+                export_preview_png(
+                    base_image_path=local_src_png_path,
+                    rooms=rooms_json,
+                    devices=devices_json,
+                    routes=routes_json,
+                    out_path=preview_path,
+                )
+            else:
+                export_preview_canvas_png(
+                    rooms=rooms_json,
+                    devices=devices_json,
+                    routes=routes_json,
+                    out_path=preview_path,
+                )
+
             preview_key = f"exports/{req.project_id}/preview.png"
             exported_files.append(preview_path)
             uploaded_uris.append(upload_file(EXPORT_BUCKET, preview_path, preview_key))
@@ -543,100 +576,120 @@ async def infer(req: APIInferRequest):
         except Exception as e:
             uploaded_uris.append(f"ERROR:preview:{e}")
 
-    # --- DXF ---
-    dxf_key: Optional[str] = None
-    if "DXF" in wants:
-        dxf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.dxf"
-        export_dxf(req.project_id, rooms_json, devices_json, routes_json, dxf_path)
-        exported_files.append(dxf_path)
+        # --- DXF ---
+        dxf_key: Optional[str] = None
+        if "DXF" in wants:
+            dxf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.dxf"
+            export_dxf(req.project_id, rooms_json, devices_json, routes_json, dxf_path)
+            exported_files.append(dxf_path)
+            try:
+                dxf_key = f"drawings/{osp.basename(dxf_path)}"
+                uploaded_uris.append(upload_file(EXPORT_BUCKET, dxf_path, dxf_key))
+                exported_keys.append(dxf_key)
+            except Exception as e:
+                uploaded_uris.append(f"ERROR:dxf:{e}")
+
+        # --- PDF ---
+        pdf_key: Optional[str] = None
+        if "PDF" in wants:
+            pdf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.pdf"
+            export_pdf(req.project_id, rooms_json, devices_json, routes_json, pdf_path)
+            exported_files.append(pdf_path)
+            try:
+                pdf_key = f"drawings/{osp.basename(pdf_path)}"
+                uploaded_uris.append(upload_file(EXPORT_BUCKET, pdf_path, pdf_key))
+                exported_keys.append(pdf_key)
+            except Exception as e:
+                uploaded_uris.append(f"ERROR:pdf:{e}")
+
+        # --- PNG overlay (only if requested) ---
+        overlay_key: Optional[str] = None
+        if "PNG" in wants:
+            try:
+                overlay_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}_overlay.png"
+                if local_src_png_path and osp.exists(local_src_png_path):
+                    export_overlay_png(local_src_png_path, rooms_json, devices_json, routes_json, overlay_path)
+                else:
+                    export_preview_canvas_png(
+                        rooms=rooms_json,
+                        devices=devices_json,
+                        routes=routes_json,
+                        out_path=overlay_path,
+                    )
+
+                exported_files.append(overlay_path)
+                overlay_key = f"overlays/{osp.basename(overlay_path)}"
+                uploaded_uris.append(upload_file(EXPORT_BUCKET, overlay_path, overlay_key))
+                exported_keys.append(overlay_key)
+            except Exception as e:
+                uploaded_uris.append(f"ERROR:overlay:{e}")
+
+        # --- JSON result (ALWAYS) ---
+        result_key = f"results/{req.project_id}.json"
+        result_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.json"
+
+        DB["exports"][req.project_id] = {
+            "exported_files": exported_files,
+            "uploaded_uris": uploaded_uris,
+            "keys": exported_keys,
+            "preview_key": preview_key,
+            "dxf_key": dxf_key,
+            "pdf_key": pdf_key,
+            "overlay_key": overlay_key,
+            "result_json_key": result_key,
+        }
+
+        artifacts_manifest = build_artifacts_manifest(req.project_id)
+
+        result_payload = {
+            "project_id": req.project_id,
+            "rooms": rooms_json,
+            "devices": devices_json,
+            "routes": routes_json,
+            "violations": violations,
+            "bom": bom,
+            "preview_key": preview_key,
+            "overlay_key": overlay_key,
+            "pdf_key": pdf_key,
+            "dxf_key": dxf_key,
+            "result_json_key": result_key,
+            "export_keys": exported_keys,
+            "artifacts": artifacts_manifest,
+        }
+
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(result_payload, f, ensure_ascii=False, indent=2, default=_json_default)
+
         try:
-            dxf_key = f"drawings/{osp.basename(dxf_path)}"
-            uploaded_uris.append(upload_file(EXPORT_BUCKET, dxf_path, dxf_key))
-            exported_keys.append(dxf_key)
+            uploaded_uris.append(upload_file(EXPORT_BUCKET, result_path, result_key))
+            exported_keys.append(result_key)
         except Exception as e:
-            uploaded_uris.append(f"ERROR:dxf:{e}")
+            uploaded_uris.append(f"ERROR:result_json:{e}")
 
-    # --- PDF ---
-    pdf_key: Optional[str] = None
-    if "PDF" in wants:
-        pdf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.pdf"
-        export_pdf(req.project_id, rooms_json, devices_json, routes_json, pdf_path)
-        exported_files.append(pdf_path)
-        try:
-            pdf_key = f"drawings/{osp.basename(pdf_path)}"
-            uploaded_uris.append(upload_file(EXPORT_BUCKET, pdf_path, pdf_key))
-            exported_keys.append(pdf_key)
-        except Exception as e:
-            uploaded_uris.append(f"ERROR:pdf:{e}")
+        DB["exports"][req.project_id].update(
+            {
+                "uploaded_uris": uploaded_uris,
+                "keys": exported_keys,
+                "result_json_key": result_key,
+            }
+        )
 
-    # --- PNG overlay (only if requested) ---
-    overlay_key: Optional[str] = None
-    if "PNG" in wants and local_src_png_path and osp.exists(local_src_png_path):
-        try:
-            overlay_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}_overlay.png"
-            export_overlay_png(local_src_png_path, rooms_json, devices_json, routes_json, overlay_path)
-            exported_files.append(overlay_path)
-            overlay_key = f"overlays/{osp.basename(overlay_path)}"
-            uploaded_uris.append(upload_file(EXPORT_BUCKET, overlay_path, overlay_key))
-            exported_keys.append(overlay_key)
-        except Exception as e:
-            uploaded_uris.append(f"ERROR:overlay:{e}")
+        ttl = _artifact_ttl_seconds()
+        artifacts = build_artifacts_index(req.project_id, expires_seconds=ttl)
 
-    # --- JSON result (ALWAYS) ---
-    result_key = f"results/{req.project_id}.json"
-    result_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.json"
-
-    artifacts = {
-        "preview_key": preview_key,
-        "dxf_key": dxf_key,
-        "pdf_key": pdf_key,
-        "overlay_key": overlay_key,
-        "result_json_key": result_key,
-        "export_keys": exported_keys,
-    }
-
-    result_payload = {
-        "project_id": req.project_id,
-        "plan_graph": DB.get("plan_graph", {}).get(req.project_id),
-        "structure": DB.get("structure", {}).get(req.project_id),
-        "rooms": rooms_json,
-        "devices": devices_json,
-        "routes": routes_json,
-        "lighting_summary": lighting_summary,
-        "violations": violations,
-        "artifacts": artifacts,
-    }
-
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(result_payload, f, ensure_ascii=False, indent=2, default=_json_default)
-
-    try:
-        uploaded_uris.append(upload_file(EXPORT_BUCKET, result_path, result_key))
-        exported_keys.append(result_key)
+        return {
+            "project_id": req.project_id,
+            "rooms": rooms_json,
+            "devices": devices_json,
+            "routes": routes_json,
+            "violations": violations,
+            "bom": bom,
+            "exports": DB.get("exports", {}).get(req.project_id, {}),
+            "artifacts": artifacts,
+            "expiresSeconds": ttl,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        uploaded_uris.append(f"ERROR:result_json:{e}")
-
-    DB["exports"][req.project_id] = {
-        "exported_files": exported_files,
-        "uploaded_uris": uploaded_uris,
-        "keys": exported_keys,
-        "preview_key": preview_key,
-        "dxf_key": dxf_key,
-        "pdf_key": pdf_key,
-        "overlay_key": overlay_key,
-        "result_json_key": result_key,
-    }
-
-    return {
-        "project_id": req.project_id,
-        "parsed": parsed.model_dump(),
-        "lighting_summary": lighting_summary,
-        "rooms": rooms_json,
-        "devices": devices_json,
-        "routes": routes_json,
-        "plan_graph": DB.get("plan_graph", {}).get(req.project_id),
-        "structure": DB.get("structure", {}).get(req.project_id),
-        "violations": violations,
-        "exports": DB.get("exports", {}).get(req.project_id, {}),
-        "artifacts": artifacts,
-    }
+        logger.exception("infer failed project_id=%s", getattr(req, "project_id", None))
+        raise HTTPException(status_code=500, detail=f"Infer failed: {type(e).__name__}: {e}")
