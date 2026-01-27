@@ -2,17 +2,19 @@ import argparse
 import os
 import random
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import List
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
-import torchvision
 from torchvision.models.segmentation import deeplabv3_resnet50
 
 from app.ml.resplan_dataset import ResPlanRasterDataset
+
+
+CLASS_NAMES = ["bg", "wall", "door", "window", "front_door"]
 
 
 @dataclass
@@ -39,6 +41,7 @@ def set_seed(seed: int) -> None:
 
 
 def build_model(num_classes: int) -> nn.Module:
+    # no pretrained weights, since your domain is CAD-like
     model = deeplabv3_resnet50(weights=None, weights_backbone=None, num_classes=num_classes)
     return model
 
@@ -63,24 +66,35 @@ def compute_pixel_hist(dataset_root: str, num_classes: int) -> np.ndarray:
 def make_class_weights_from_hist(hist: np.ndarray) -> torch.Tensor:
     """
     Robust weights for heavy imbalance.
-    We use inverse sqrt frequency with smoothing to avoid insane weights.
+    IMPORTANT FIX:
+      - classes with hist==0 must NOT affect normalization (your front_door was 0 -> destroyed weights).
     """
     hist = hist.astype(np.float64)
-    total = float(hist.sum() + 1e-9)
-    freq = hist / total
+    w = np.zeros_like(hist, dtype=np.float64)
 
-    # Avoid div by zero
+    nonzero = hist > 0
+    if nonzero.sum() == 0:
+        return torch.ones_like(torch.tensor(hist, dtype=torch.float32))
+
+    total = float(hist[nonzero].sum() + 1e-9)
+    freq = hist[nonzero] / total
     freq = np.clip(freq, 1e-9, 1.0)
 
-    inv = 1.0 / np.sqrt(freq)  # milder than 1/freq
-    inv = inv / inv.mean()     # normalize
+    inv = 1.0 / np.sqrt(freq)          # milder than 1/freq
+    inv = inv / float(inv.mean())      # normalize only over non-zero classes
+    inv = np.clip(inv, 0.2, 10.0)      # cap
 
-    # Cap extreme weights
-    inv = np.clip(inv, 0.2, 10.0)
-    return torch.tensor(inv, dtype=torch.float32)
+    w[nonzero] = inv
+    w[~nonzero] = 0.0                  # class absent => ignore (no target pixels anyway)
+    return torch.tensor(w, dtype=torch.float32)
 
 
-def dice_loss_multiclass(logits: torch.Tensor, target: torch.Tensor, num_classes: int, eps: float = 1e-6) -> torch.Tensor:
+def dice_loss_multiclass(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    eps: float = 1e-6
+) -> torch.Tensor:
     """
     Soft Dice over classes (excluding bg=0).
     logits: (N,C,H,W)
@@ -88,7 +102,6 @@ def dice_loss_multiclass(logits: torch.Tensor, target: torch.Tensor, num_classes
     """
     probs = torch.softmax(logits, dim=1)
 
-    # one-hot target
     t = torch.zeros_like(probs)
     t.scatter_(1, target.unsqueeze(1), 1.0)
 
@@ -100,6 +113,7 @@ def dice_loss_multiclass(logits: torch.Tensor, target: torch.Tensor, num_classes
         denom = pc.sum(dim=(1, 2)) + tc.sum(dim=(1, 2)) + eps
         d = 1.0 - (2.0 * inter + eps) / denom
         dices.append(d.mean())
+
     if not dices:
         return torch.tensor(0.0, device=logits.device)
     return torch.stack(dices).mean()
@@ -187,6 +201,7 @@ def main() -> None:
     if cfg.auto_class_weights:
         hist = compute_pixel_hist(cfg.data, cfg.num_classes)
         w = make_class_weights_from_hist(hist).to(device)
+        print("pixel_hist:", hist.tolist())
         print("class_weights:", w.detach().cpu().numpy().round(4).tolist())
         ce = nn.CrossEntropyLoss(weight=w)
     else:
@@ -204,7 +219,12 @@ def main() -> None:
 
         if va < best:
             best = va
-            torch.save(model.state_dict(), cfg.out)
+            ckpt = {
+                "model": model.state_dict(),
+                "num_classes": cfg.num_classes,
+                "class_names": CLASS_NAMES[: cfg.num_classes],
+            }
+            torch.save(ckpt, cfg.out)
             print(f"saved best -> {cfg.out}")
 
     print("done.")

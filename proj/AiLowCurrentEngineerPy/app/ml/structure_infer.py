@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import os.path as osp
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Any
 
 import cv2
 import numpy as np
@@ -14,9 +14,8 @@ from torchvision.transforms import functional as TF
 from app.ml.model_structure import build_structure_model
 
 
-CLASS_NAMES = ["bg", "wall", "door", "window", "front_door"]
+DEFAULT_CLASS_NAMES = ["bg", "wall", "door", "window", "front_door"]
 
-# BGR palette for OpenCV visualization
 PALETTE: Dict[int, Tuple[int, int, int]] = {
     0: (0, 0, 0),         # bg
     1: (0, 0, 255),       # wall - red
@@ -44,13 +43,27 @@ def _overlay(img_bgr: np.ndarray, color_mask_bgr: np.ndarray, alpha: float = 0.4
 
 
 def _load_checkpoint(ckpt_path: str, device: torch.device):
-    ckpt = torch.load(ckpt_path, map_location=device)
-    num_classes = int(ckpt.get("num_classes", len(CLASS_NAMES)))
+    """
+    Supports BOTH formats:
+      1) checkpoint dict: {"model": state_dict, "num_classes": int, ...}
+      2) raw state_dict (what torch.save(model.state_dict()) produces)
+    """
+    ckpt: Any = torch.load(ckpt_path, map_location=device)
+
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        state = ckpt["model"]
+        num_classes = int(ckpt.get("num_classes", len(DEFAULT_CLASS_NAMES)))
+        class_names = ckpt.get("class_names", DEFAULT_CLASS_NAMES[:num_classes])
+    else:
+        state = ckpt
+        num_classes = len(DEFAULT_CLASS_NAMES)
+        class_names = DEFAULT_CLASS_NAMES
+
     model = build_structure_model(num_classes=num_classes)
-    model.load_state_dict(ckpt["model"], strict=True)
+    model.load_state_dict(state, strict=True)
     model.to(device)
     model.eval()
-    return model, num_classes
+    return model, num_classes, list(class_names)
 
 
 def _resize_max_side(img_bgr: np.ndarray, max_side: int) -> np.ndarray:
@@ -67,11 +80,6 @@ def _resize_max_side(img_bgr: np.ndarray, max_side: int) -> np.ndarray:
 
 
 def _preprocess(img_bgr: np.ndarray, mode: str, invert: bool) -> np.ndarray:
-    """
-    mode:
-      - none: no changes
-      - binarize: adaptive threshold -> 3-channel (reduces domain gap for line drawings)
-    """
     if invert:
         img_bgr = 255 - img_bgr
 
@@ -90,8 +98,6 @@ def _preprocess(img_bgr: np.ndarray, mode: str, invert: bool) -> np.ndarray:
             35,
             5,
         )
-        # хотим "белый фон + тёмные линии"
-        # adaptiveThreshold даёт белое/чёрное; оставим как есть
         out = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
         return out
 
@@ -100,34 +106,30 @@ def _preprocess(img_bgr: np.ndarray, mode: str, invert: bool) -> np.ndarray:
 
 @torch.no_grad()
 def infer_one(model, img_bgr: np.ndarray, device: torch.device) -> np.ndarray:
-    # Training was done with ToTensor only (no ImageNet normalize).
-    # Поэтому здесь тоже НЕ делаем normalize.
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     image_pil = Image.fromarray(img_rgb).convert("RGB")
-
     x = TF.to_tensor(image_pil).unsqueeze(0).to(device)  # [1,3,H,W]
-    out = model(x)["out"]  # torchvision segmentation output dict uses "out" :contentReference[oaicite:2]{index=2}
-    pred = out.argmax(dim=1).squeeze(0).detach().cpu().numpy().astype(np.uint8)  # [H,W]
+    out = model(x)["out"]
+    pred = out.argmax(dim=1).squeeze(0).detach().cpu().numpy().astype(np.uint8)
     return pred
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True, help="Path to models/structure_resplan.pt")
-    ap.add_argument("--image", required=True, help="Input image path (png/jpg)")
-    ap.add_argument("--out", default="out/structure_infer", help="Output folder")
-    ap.add_argument("--alpha", type=float, default=0.45, help="Overlay alpha")
-    ap.add_argument("--max-side", type=int, default=1600, help="Resize so max(H,W)<=max-side (0=disable)")
-    ap.add_argument("--preprocess", default="binarize", choices=["none", "binarize"], help="Preprocess mode")
-    ap.add_argument("--invert", action="store_true", help="Invert colors before preprocess")
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--image", required=True)
+    ap.add_argument("--out", default="out/structure_infer")
+    ap.add_argument("--alpha", type=float, default=0.45)
+    ap.add_argument("--max-side", type=int, default=1600)
+    ap.add_argument("--preprocess", default="binarize", choices=["none", "binarize"])
+    ap.add_argument("--invert", action="store_true")
     args = ap.parse_args()
 
     _ensure_dir(args.out)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, num_classes = _load_checkpoint(args.ckpt, device)
+    model, num_classes, class_names = _load_checkpoint(args.ckpt, device)
 
-    # load with cv2 to keep control
     img_bgr = cv2.imread(args.image, cv2.IMREAD_COLOR)
     if img_bgr is None:
         raise SystemExit(f"Cannot read image: {args.image}")
@@ -153,14 +155,14 @@ def main() -> None:
     cv2.imwrite(overlay_path, overlay)
 
     uniq = np.unique(pred).tolist()
-    used = [CLASS_NAMES[i] if i < len(CLASS_NAMES) else str(i) for i in uniq]
+    used = [class_names[i] if i < len(class_names) else str(i) for i in uniq]
 
-    # coverage stats
     total = float(pred.size)
-    cov = {}
+    cov_items: List[Tuple[str, float]] = []
     for cid in uniq:
-        cov_name = CLASS_NAMES[cid] if cid < len(CLASS_NAMES) else str(cid)
-        cov[cov_name] = float((pred == cid).sum()) / total
+        name = class_names[cid] if cid < len(class_names) else str(cid)
+        cov = float((pred == cid).sum()) / total
+        cov_items.append((name, cov))
 
     print("Saved:")
     print(f"  {preproc_path}")
@@ -170,9 +172,8 @@ def main() -> None:
     print(f"Input: {orig_w}x{orig_h}  -> used for infer: {img_bgr.shape[1]}x{img_bgr.shape[0]}")
     print(f"Classes in prediction: {uniq} -> {used} (num_classes={num_classes})")
     print("Coverage:")
-    for k, v in cov.items():
-        print(f"  {k:12s}: {v:.3f}")
-
+    for k, v in cov_items:
+        print(f"  {k:12s}: {v*100:.3f}%")
 
 if __name__ == "__main__":
     main()
