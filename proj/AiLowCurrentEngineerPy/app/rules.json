@@ -1,0 +1,121 @@
+{
+  "_comment": "Правила размещения слаботочных устройств. СП 31-110-2003, ГОСТ Р 53325-2012, СП 5.13130.2009",
+
+  "devices": {
+
+    "TV_SOCKET": {
+      "label": "Розетка ТВ",
+      "symbol": "TV",
+      "mount": "wall",
+      "height_mm": 300,
+      "min_from_door_mm": 150,
+      "min_from_window_mm": 100,
+      "min_from_corner_mm": 150,
+      "rooms": {
+        "living_room": {"count": 2},
+        "bedroom":     {"count": 1},
+        "kitchen":     {"count": 1}
+      }
+    },
+
+    "INTERNET_SOCKET": {
+      "label": "Розетка интернет (RJ-45)",
+      "symbol": "NET",
+      "mount": "wall",
+      "height_mm": 300,
+      "min_from_door_mm": 150,
+      "min_from_window_mm": 100,
+      "min_from_corner_mm": 150,
+      "rooms": {
+        "living_room": {"count": 2},
+        "bedroom":     {"count": 1},
+        "kitchen":     {"count": 1},
+        "corridor":    {"count": 1}
+      }
+    },
+
+    "SMOKE_DETECTOR": {
+      "label": "Датчик дыма",
+      "symbol": "SD",
+      "mount": "ceiling",
+      "height_mm": 0,
+      "min_from_wall_mm": 500,
+      "min_from_other_detector_mm": 3000,
+      "max_coverage_m2": 85,
+      "_gost": "ГОСТ Р 53325-2012, СП 5.13130.2009 п.13.3",
+      "rooms": {
+        "living_room": {"per_m2": 85},
+        "bedroom":     {"per_m2": 85},
+        "kitchen":     {"count": 0, "_comment": "Кухни исключены — ложные срабатывания от пара/дыма"},
+        "corridor":    {"per_m2": 85},
+        "bathroom":    {"count": 0},
+        "toilet":      {"count": 0}
+      },
+      "default_per_m2": 85
+    },
+
+    "CO2_DETECTOR": {
+      "label": "Датчик CO2/воздуха",
+      "symbol": "CO2",
+      "mount": "wall",
+      "height_mm": 1500,
+      "min_from_wall_mm": 0,
+      "min_from_door_mm": 300,
+      "min_from_window_mm": 500,
+      "_gost": "СанПиН 2.1.3684-21, рекомендации производителей",
+      "rooms": {
+        "living_room": {"count": 1},
+        "bedroom":     {"count": 1},
+        "kitchen":     {"count": 1},
+        "corridor":    {"count": 0}
+      }
+    },
+
+    "CEILING_LIGHT": {
+      "label": "Основное освещение (потолок)",
+      "symbol": "CL",
+      "mount": "ceiling",
+      "height_mm": 0,
+      "placement": "center",
+      "_gost": "СП 52.13330.2016",
+      "rooms": {
+        "living_room": {"per_m2": 20, "min": 1, "max": 4},
+        "bedroom":     {"per_m2": 12, "min": 1, "max": 2},
+        "kitchen":     {"per_m2": 10, "min": 1, "max": 2},
+        "bathroom":    {"count": 1},
+        "toilet":      {"count": 1},
+        "corridor":    {"per_m2": 8,  "min": 1, "max": 3}
+      }
+    },
+
+    "NIGHT_LIGHT": {
+      "label": "Ночник / бра",
+      "symbol": "NL",
+      "mount": "wall",
+      "height_mm": 1400,
+      "min_from_door_mm": 200,
+      "placement": "near_window",
+      "rooms": {
+        "bedroom": {"count": 1},
+        "corridor": {"count": 1}
+      }
+    }
+  },
+
+  "per_room_requirements": {
+    "LIVING":   {"socket_per_wall_meter": 0.3},
+    "BEDROOM":  {"socket_per_wall_meter": 0.2},
+    "KITCHEN":  {"socket_per_wall_meter": 0.4},
+    "BATHROOM": {"socket_per_wall_meter": 0.1},
+    "CORRIDOR": {"socket_per_wall_meter": 0.1}
+  },
+
+  "room_type_map": {
+    "living_room": "LIVING",
+    "bedroom":     "BEDROOM",
+    "kitchen":     "KITCHEN",
+    "bathroom":    "BATHROOM",
+    "toilet":      "BATHROOM",
+    "corridor":    "CORRIDOR"
+  }
+}
