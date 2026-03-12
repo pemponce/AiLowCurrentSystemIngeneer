@@ -28,6 +28,79 @@ from app.api_state import router as state_router
 from app.structure_detect import detect_structure
 from app.artifacts_index import build_artifacts_index, build_artifacts_manifest
 
+# NN-2: парсинг пожеланий клиента
+try:
+    from app.nn2.infer import parse_text as nn2_parse_text
+    _NN2_AVAILABLE = True
+except Exception as _nn2_err:
+    _NN2_AVAILABLE = False
+    logger_tmp = __import__("logging").getLogger("planner")
+    logger_tmp.warning(f"NN-2 недоступна: {_nn2_err}")
+
+# NN-3: размещение устройств
+try:
+    from app.nn3.infer import run_placement as nn3_run_placement
+    _NN3_AVAILABLE = True
+except Exception as _nn3_err:
+    _NN3_AVAILABLE = False
+    logger_tmp2 = __import__("logging").getLogger("planner")
+    logger_tmp2.warning(f"NN-3 недоступна: {_nn3_err}")
+
+# NN-1: сегментация + классификация комнат
+try:
+    import torch as _torch
+    import cv2 as _cv2
+    from app.ml.structure_infer import _load_checkpoint as _nn1_load_ckpt, infer_one as _nn1_infer_one, _preprocess as _nn1_preprocess
+    from app.ml.structure_postprocess import extract_geometry as _nn1_extract_geometry
+    _NN1_CKPT = "models/structure_rf_v4_bestreal.pt"
+    _nn1_model = None
+    _NN1_AVAILABLE = True
+except Exception as _nn1_err:
+    import logging as _logging
+    _logging.getLogger("planner").warning(f"NN-1 недоступна: {_nn1_err}")
+    _NN1_AVAILABLE = False
+
+def _nn1_get_rooms(image_path: str, project_id: str) -> list:
+    """Запускает NN-1 и возвращает список комнат с типами и polygonPx."""
+    if not _NN1_AVAILABLE:
+        return []
+    global _nn1_model
+    try:
+        import os, cv2
+        device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+        if _nn1_model is None:
+            _nn1_model, _, _ = _nn1_load_ckpt(_NN1_CKPT, device)
+        img = cv2.imread(image_path)
+        if img is None:
+            return []
+        img_prep = _nn1_preprocess(img, mode="binarize", invert=False)
+        pred_mask = _nn1_infer_one(_nn1_model, img_prep, device)
+        # Сохраняем маску во временный файл
+        mask_path = f"/tmp/exports/{project_id}_nn1_mask.png"
+        os.makedirs("/tmp/exports", exist_ok=True)
+        cv2.imwrite(mask_path, pred_mask)
+        # Извлекаем геометрию с классификацией комнат
+        geom = _nn1_extract_geometry(mask_path, image_path=image_path)
+        rooms_out = []
+        for i, r in enumerate(geom.get("rooms", [])):
+            contour = r.get("contour")
+            poly_px = contour.reshape(-1, 2).tolist() if contour is not None else []
+            rooms_out.append({
+                "id":         f"room_{i:03d}",
+                "polygonPx":  poly_px,
+                "roomType":   r.get("room_type", "bedroom"),
+                "areaM2":     r.get("area_m2", 10.0),
+                "areaPx":     r.get("area_px", 0),
+                "isExterior": r.get("room_type") in {"living_room", "bedroom", "kitchen"},
+            })
+        logger.info("NN-1: %d комнат для project %s", len(rooms_out), project_id)
+        return rooms_out
+    except Exception as e:
+        logger.warning("NN-1 extract_rooms failed: %s", e)
+        return []
+
+
+
 app = FastAPI(title="Low-Current Planner")
 app.include_router(structure_router)
 app.include_router(artifacts_router)
@@ -305,32 +378,16 @@ class PreferenceParseResponse(BaseModel):
     notes: Optional[str] = None
 
 
-def _parse_preferences(text: Optional[str]) -> PreferenceParseResponse:
-    resp = PreferenceParseResponse(per_room_target_lux={})
+def _parse_preferences(text: Optional[str], project_id: str = "unknown") -> dict:
+    """Парсит пожелания через NN-2. Возвращает PreferencesGraph dict."""
     if not text:
-        resp.notes = "preferences_text is empty"
-        return resp
-
-    pattern = regex.compile(
-        r"([A-Za-zА-Яа-яЁё0-9 _\\-]+?)\\s*[:\\-]?\\s*(\\d+)\\s*(?:лк|lx|lux)\\b",
-        regex.IGNORECASE,
-    )
-    for name, val in pattern.findall(text):
-        room = name.strip().lower()
-        try:
-            lux = float(val)
-            resp.per_room_target_lux[room] = lux  # type: ignore[index]
-        except Exception:
-            pass
-
-    if not resp.per_room_target_lux:
-        only_num = regex.search(r"\\b(\\d+)\\s*(?:лк|lx|lux)\\b", text, flags=regex.IGNORECASE)
-        if only_num:
-            resp.target_lux = float(only_num.group(1))
-
-    if not resp.per_room_target_lux and not resp.target_lux:
-        resp.notes = "Could not parse lux targets"
-    return resp
+        return {"version": "preferences-1.0", "projectId": project_id,
+                "sourceText": "", "global": {}, "rooms": []}
+    if _NN2_AVAILABLE:
+        return nn2_parse_text(text, project_id=project_id)
+    # fallback: пустой граф
+    return {"version": "preferences-1.0", "projectId": project_id,
+            "sourceText": text, "global": {}, "rooms": []}
 
 
 def _ensure_geometry_from_key(project_id: str, src_key: Optional[str]) -> None:
@@ -445,14 +502,87 @@ async def route(req: APIRouteRequest):
 @app.post("/export")
 async def export(req: APIExportRequest):
     try:
-        rooms = DB.get("rooms", {}).get(req.project_id, [])
-        devices = _devices_to_json(DB.get("devices", {}).get(req.project_id, []))
-        routes = DB.get("routes", {}).get(req.project_id, [])
-        DB["devices"][req.project_id] = devices  # normalize
+        routes  = DB.get("routes",  {}).get(req.project_id, [])
+
+        # ── 1. Комнаты: объединяем геометрию из DB["rooms"] с типами из DesignGraph ──
+        legacy_rooms  = DB.get("rooms",  {}).get(req.project_id, []) or []
+        design_graph  = DB.get("design", {}).get(req.project_id)
+
+        # Строим map room_id → roomType из DesignGraph.roomDesigns
+        room_type_map: dict = {}
+        if design_graph:
+            for rd in design_graph.get("roomDesigns", []):
+                rid   = rd.get("roomId", "")
+                rtype = rd.get("roomType", "bedroom")
+                if rid:
+                    room_type_map[rid] = rtype
+
+        # Обогащаем legacy_rooms типами из DesignGraph
+        # Сортируем по площади чтобы совпасть с порядком назначения типов в /design
+        def _area_from_room(r):
+            a = r.get("areaM2") or r.get("area")
+            if a:
+                return float(a)
+            poly = r.get("polygonPx") or []
+            if len(poly) >= 3:
+                n = len(poly)
+                area = 0
+                for ii in range(n):
+                    jj = (ii + 1) % n
+                    area += poly[ii][0] * poly[jj][1]
+                    area -= poly[jj][0] * poly[ii][1]
+                return abs(area) / 2 * 0.000196
+            return float(r.get("areaPx", 0)) * 0.000196
+
+        MIN_AREA_M2 = 3.0
+        MAX_AREA_M2 = 200.0
+        ROOM_TYPES_CYCLE = [
+            "living_room", "bedroom", "bedroom", "kitchen",
+            "bathroom", "corridor", "toilet",
+        ]
+
+        # Фильтруем и сортируем как в /design
+        filtered = sorted(
+            [(r, _area_from_room(r)) for r in legacy_rooms
+             if MIN_AREA_M2 <= _area_from_room(r) <= MAX_AREA_M2],
+            key=lambda x: x[1], reverse=True
+        )
+
+        rooms = []
+        for i, (r, area_m2) in enumerate(filtered):
+            rid   = r.get("id") or f"room_{i:03d}"
+            rtype = room_type_map.get(rid) or ROOM_TYPES_CYCLE[i % len(ROOM_TYPES_CYCLE)]
+            rooms.append({**r, "id": rid, "roomType": rtype, "areaM2": area_m2})
+
+        # ── 2. Устройства из DesignGraph с room_id (без координат — export_pdf сам считает центроид) ──
+        if design_graph and "devices" in design_graph:
+            devices = []
+            for d in design_graph["devices"]:
+                devices.append({
+                    "kind":    d.get("kind", "UNKNOWN"),
+                    "type":    d.get("kind", "UNKNOWN"),   # legacy compat
+                    "label":   d.get("label", ""),
+                    "roomRef": d.get("roomRef", ""),
+                    "room_id": d.get("roomRef", ""),       # legacy compat
+                    # x/y НЕ передаём — export_pdf вычислит из центроида полигона
+                })
+        else:
+            devices = _devices_to_json(DB.get("devices", {}).get(req.project_id, []))
+
+        DB.setdefault("devices", {})[req.project_id] = devices
 
         out_paths: List[str] = []
         uploaded: List[str] = []
         keys: List[str] = []
+
+        # Источник для overlay PNG
+        src_key = (DB.get("source", {}).get(req.project_id) or {}).get("src_key")
+        local_src_png: Optional[str] = None
+        if src_key:
+            try:
+                local_src_png = _ensure_png_path(_download_from_raw(src_key))
+            except Exception:
+                local_src_png = None
 
         if "DXF" in req.formats:
             dxf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.dxf"
@@ -463,6 +593,23 @@ async def export(req: APIExportRequest):
             pdf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.pdf"
             export_pdf(req.project_id, rooms, devices, routes, pdf_path)
             out_paths.append(pdf_path)
+
+        if "PNG" in req.formats:
+            try:
+                png_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}_overlay.png"
+                # Передаём комнаты с polygonPx для центроидов
+                # Приоритет: DB["rooms"] после NN-1 (содержат polygonPx + roomType)
+                db_rooms = DB.get("rooms", {}).get(req.project_id, []) or []
+                rooms_with_poly = db_rooms if db_rooms else (legacy_rooms if legacy_rooms else rooms)
+                if local_src_png and osp.exists(local_src_png):
+                    export_overlay_png(local_src_png, rooms_with_poly, devices, routes, png_path)
+                else:
+                    export_preview_canvas_png(
+                        rooms=rooms_with_poly, devices=devices, routes=routes, out_path=png_path
+                    )
+                out_paths.append(png_path)
+            except Exception as e:
+                logger.warning("PNG export failed: %s", e)
 
         for p in out_paths:
             key = f"drawings/{osp.basename(p)}"
@@ -494,6 +641,199 @@ async def export(req: APIExportRequest):
         raise HTTPException(status_code=500, detail=f"Export failed: {type(e).__name__}: {e}")
 
 
+class PreferencesParseRequest(BaseModel):
+    project_id: str = Field(default="unknown", validation_alias=AliasChoices("projectId", "project_id"))
+    text: str
+
+
+@app.post("/preferences/parse", tags=["preferences"])
+async def preferences_parse(req: PreferencesParseRequest):
+    """Парсит пожелания клиента через NN-2 → PreferencesGraph."""
+    result = _parse_preferences(req.text, project_id=req.project_id)
+    DB.setdefault("preferences", {})[req.project_id] = result
+    return result
+
+
+class DesignRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    project_id:       str            = Field(validation_alias=AliasChoices("projectId", "project_id"))
+    preferences_text: Optional[str]  = Field(default=None, validation_alias=AliasChoices("preferencesText", "preferences_text"))
+
+
+
+@app.get("/debug/db/{project_id}", tags=["debug"])
+async def debug_db(project_id: str):
+    """Показывает что лежит в DB для project_id."""
+    return {
+        "has_rooms":      bool(DB.get("rooms", {}).get(project_id)),
+        "n_rooms":        len(DB.get("rooms", {}).get(project_id) or []),
+        "has_plan_graph": bool(DB.get("plan_graph", {}).get(project_id)),
+        "has_preferences":bool(DB.get("preferences", {}).get(project_id)),
+        "rooms_sample":   (DB.get("rooms", {}).get(project_id) or [])[:2],
+        "db_keys":        list(DB.keys()),
+    }
+
+@app.post("/design", tags=["design"])
+async def design(req: DesignRequest):
+    """
+    NN-2 + NN-3 pipeline:
+      1. Берём PlanGraph из DB (должен быть после /ingest или /structure)
+      2. NN-2 парсит пожелания → PreferencesGraph
+      3. NN-3 размещает устройства → DesignGraph
+      4. Сохраняем в DB
+    """
+    project_id = req.project_id
+
+    # Берём PlanGraph из DB
+    # Приоритет: plan_graph (новый формат) → NN-1 → rooms (старый /ingest формат)
+    plan_graph = DB.get("plan_graph", {}).get(project_id)
+
+    # NN-1: если нет plan_graph — запускаем NN-1 для получения комнат с типами
+    if not plan_graph:
+        src_key_for_nn1 = (DB.get("source", {}).get(project_id) or {}).get("src_key")
+        local_path_for_nn1 = (DB.get("source_meta", {}).get(project_id) or {}).get("localPath")
+        if not local_path_for_nn1 and src_key_for_nn1:
+            try:
+                local_path_for_nn1 = _download_from_raw(src_key_for_nn1)
+            except Exception:
+                local_path_for_nn1 = None
+        if local_path_for_nn1:
+            nn1_rooms = _nn1_get_rooms(local_path_for_nn1, project_id)
+            if nn1_rooms:
+                # Сохраняем в DB и строим plan_graph
+                DB.setdefault("rooms", {})[project_id] = nn1_rooms
+                plan_graph = {
+                    "projectId": project_id,
+                    "rooms":     nn1_rooms,
+                    "openings":  [],
+                    "topology":  {"roomAdjacency": []},
+                }
+                DB.setdefault("plan_graph", {})[project_id] = plan_graph
+                logger.info("NN-1: построен plan_graph с %d комнатами", len(nn1_rooms))
+
+    if not plan_graph:
+        # Fallback: конвертируем старый DB["rooms"] в PlanGraph-совместимый dict
+        rooms_legacy = DB.get("rooms", {}).get(project_id)
+        if rooms_legacy:
+            converted = []
+            # Карта label → room_type (из geometry_png)
+            LABEL_MAP = {
+                "living_room": "living_room", "гостиная": "living_room",
+                "bedroom":     "bedroom",     "спальня":  "bedroom",
+                "kitchen":     "kitchen",     "кухня":    "kitchen",
+                "bathroom":    "bathroom",    "ванная":   "bathroom",
+                "toilet":      "toilet",      "туалет":   "toilet",
+                "corridor":    "corridor",    "коридор":  "corridor",
+                "hall":        "corridor",    "прихожая": "corridor",
+            }
+            EXT_TYPES = {"living_room", "bedroom", "kitchen"}
+            MIN_AREA_M2 = 3.0   # отфильтровываем артефакты < 3м²
+            MAX_AREA_M2 = 200.0  # включаем даже большие полигоны
+            ROOM_TYPES_CYCLE = [
+                "living_room", "bedroom", "bedroom", "kitchen",
+                "bathroom", "corridor", "toilet",
+            ]
+
+            def _poly_area_px(pts):
+                """Площадь полигона по формуле Гаусса."""
+                n = len(pts)
+                area = 0
+                for ii in range(n):
+                    jj = (ii + 1) % n
+                    area += pts[ii][0] * pts[jj][1]
+                    area -= pts[jj][0] * pts[ii][1]
+                return abs(area) / 2
+
+            filtered = []
+            for r in rooms_legacy:
+                if not isinstance(r, dict):
+                    continue
+                # Считаем площадь
+                area_m2 = r.get("areaM2") or r.get("area")
+                if not area_m2:
+                    poly = r.get("polygonPx") or []
+                    if poly and len(poly) >= 3:
+                        area_px = _poly_area_px(poly)
+                    else:
+                        area_px = r.get("areaPx") or 0
+                    area_m2 = round(float(area_px) * 0.000196, 1)
+                area_m2 = float(area_m2)
+                # Фильтруем мусор
+                if area_m2 < MIN_AREA_M2 or area_m2 > MAX_AREA_M2:
+                    continue
+                filtered.append((r, area_m2))
+
+            # Сортируем по площади убыванию — большие комнаты вперёд
+            filtered.sort(key=lambda x: x[1], reverse=True)
+
+            room_idx = 0
+            for r, area_m2 in filtered:
+                label = str(r.get("label") or r.get("room_type") or r.get("roomType") or "").lower()
+                if label in LABEL_MAP:
+                    rtype = LABEL_MAP[label]
+                else:
+                    # Назначаем тип по порядку из типичной конфигурации
+                    rtype = ROOM_TYPES_CYCLE[room_idx % len(ROOM_TYPES_CYCLE)]
+                converted.append({
+                    "id":         r.get("id") or f"room_{room_idx}",
+                    "roomType":   rtype,
+                    "areaM2":     area_m2,
+                    "isExterior": rtype in EXT_TYPES,
+                })
+                room_idx += 1
+            plan_graph = {
+                "projectId": project_id,
+                "rooms":     converted,
+                "openings":  [],
+                "topology":  {"roomAdjacency": []},
+            }
+            logger.info("design: используем legacy rooms (%d комнат) для project %s",
+                        len(converted), project_id)
+
+    if not plan_graph:
+        # Детальная диагностика
+        rooms_raw = DB.get("rooms", {}).get(project_id)
+        logger.error(
+            "design 400: plan_graph=%s, rooms_raw type=%s, len=%s, project=%s",
+            DB.get("plan_graph", {}).get(project_id),
+            type(rooms_raw).__name__,
+            len(rooms_raw) if rooms_raw else 0,
+            project_id,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"PlanGraph не найден. rooms_raw={bool(rooms_raw)}, n={len(rooms_raw) if rooms_raw else 0}. Сначала вызови /ingest или /structure/detect."
+        )
+
+    # NN-2: парсим пожелания
+    prefs_graph = DB.get("preferences", {}).get(project_id)
+    if req.preferences_text:
+        prefs_graph = _parse_preferences(req.preferences_text, project_id=project_id)
+        DB.setdefault("preferences", {})[project_id] = prefs_graph
+        logger.info("NN-2: preferences parsed for project %s", project_id)
+
+    # NN-3: размещаем устройства
+    if not _NN3_AVAILABLE:
+        raise HTTPException(status_code=503, detail="NN-3 недоступна — модель не загружена")
+
+    design_graph = nn3_run_placement(
+        plan_graph=plan_graph if isinstance(plan_graph, dict) else plan_graph.dict(),
+        prefs_graph=prefs_graph,
+        project_id=project_id,
+    )
+
+    # Сохраняем в DB
+    DB.setdefault("design", {})[project_id] = design_graph
+    DB.setdefault("devices", {})[project_id] = design_graph.get("devices", [])
+
+    logger.info(
+        "NN-3: placed %d devices for project %s",
+        design_graph.get("totalDevices", 0), project_id
+    )
+
+    return design_graph
+
+
 @app.post("/infer")
 async def infer(req: APIInferRequest):
     try:
@@ -509,6 +849,13 @@ async def infer(req: APIInferRequest):
 
         _ensure_geometry_from_key(req.project_id, req.src_s3_key)
         _ensure_structure(req.project_id, req.src_s3_key, None)
+
+        # NN-2: сохраняем PreferencesGraph в DB
+        if req.preferences_text:
+            prefs = _parse_preferences(req.preferences_text, project_id=req.project_id)
+            DB.setdefault("preferences", {})[req.project_id] = prefs
+            logger.info("preferences parsed: %d rooms, global=%s",
+                        len(prefs.get("rooms", [])), prefs.get("global", {}))
 
         if not DB.get("rooms", {}).get(req.project_id):
             raise HTTPException(
