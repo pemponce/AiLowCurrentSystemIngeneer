@@ -86,33 +86,155 @@ class PlacementInfer:
         return result
 
 
+import math as _math
+
+
+def _get_walls(poly: list) -> list:
+    walls = []
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = float(poly[i][0]), float(poly[i][1])
+        x2, y2 = float(poly[(i+1)%n][0]), float(poly[(i+1)%n][1])
+        length = _math.hypot(x2-x1, y2-y1)
+        if length < 15:
+            continue
+        cx2, cy2 = (x1+x2)/2, (y1+y2)/2
+        dx, dy = (x2-x1)/length, (y2-y1)/length
+        nx, ny = dy, -dx
+        angle = _math.degrees(_math.atan2(y2-y1, x2-x1))
+        walls.append({"x1":x1,"y1":y1,"x2":x2,"y2":y2,
+                       "length":length,"cx":cx2,"cy":cy2,
+                       "nx":nx,"ny":ny,"angle":angle})
+    return walls
+
+
+def _wall_point(kind: str, poly: list, room_cx: float, room_cy: float,
+                offset: int = 22, n_device: int = 0):
+    """Возвращает (px, py) для устройства на стене или потолке."""
+    if not poly or len(poly) < 3:
+        return None, None
+    walls = _get_walls(poly)
+    if not walls:
+        return None, None
+    # Нормали внутрь
+    for w in walls:
+        tx, ty   = w["cx"] + w["nx"]*20, w["cy"] + w["ny"]*20
+        tx2, ty2 = w["cx"] - w["nx"]*20, w["cy"] - w["ny"]*20
+        if _math.hypot(tx-room_cx, ty-room_cy) > _math.hypot(tx2-room_cx, ty2-room_cy):
+            w["nx"], w["ny"] = -w["nx"], -w["ny"]
+    by_len  = sorted(walls, key=lambda w: w["length"], reverse=True)
+    h_walls = [w for w in walls if abs(w["angle"]) < 35 or abs(w["angle"]) > 145]
+    k = kind.lower()
+    if "ceiling" in k or "smoke" in k or "co2" in k or "motion" in k:
+        # Равномерная сетка по площади комнаты
+        if poly and len(poly) >= 3:
+            xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
+            x0, x1 = min(xs), max(xs)
+            y0, y1 = min(ys), max(ys)
+            w_r = x1 - x0
+            h_r = y1 - y0
+            aspect = w_r / max(1.0, h_r)
+            if aspect > 1.5:
+                cols, rows = 3, 2
+            elif aspect < 0.67:
+                cols, rows = 2, 3
+            else:
+                cols, rows = 2, 2
+            col = n_device % cols
+            row = (n_device // cols) % rows
+            pad_x = w_r * 0.15
+            pad_y = h_r * 0.15
+            step_x = (w_r - 2*pad_x) / max(1, cols-1) if cols > 1 else 0
+            step_y = (h_r - 2*pad_y) / max(1, rows-1) if rows > 1 else 0
+            return int(x0 + pad_x + col*step_x), int(y0 + pad_y + row*step_y)
+        step = 70
+        col, row = n_device % 3, n_device // 3
+        return int(room_cx + (col-1)*step), int(room_cy + (row-0.5)*step)
+    elif "tv" in k:
+        # TV — самая длинная стена далеко от центроида (внешняя стена)
+        # score = length * distance_from_centroid — предпочитаем дальние длинные стены
+        def _tv_score(w):
+            dist = _math.hypot(w["cx"] - room_cx, w["cy"] - room_cy)
+            return w["length"] * dist
+        target = max(walls, key=_tv_score)
+        t = 0.5 + (n_device * 70) / max(1.0, target["length"])
+        t = min(t, 0.85)
+        mid_x = target["x1"] + (target["x2"]-target["x1"]) * t
+        mid_y = target["y1"] + (target["y2"]-target["y1"]) * t
+        return int(mid_x + target["nx"]*offset), int(mid_y + target["ny"]*offset)
+    elif "night" in k:
+        # Ночник — короткая дальняя стена (изголовье кровати)
+        def _nch_score(w):
+            dist = _math.hypot(w["cx"] - room_cx, w["cy"] - room_cy)
+            return dist / max(1.0, w["length"])
+        target = max(walls, key=_nch_score)
+        side = 0.25 + (n_device % 2) * 0.5
+        return int(target["x1"]+(target["x2"]-target["x1"])*side + target["nx"]*offset),                int(target["y1"]+(target["y2"]-target["y1"])*side + target["ny"]*offset)
+    elif "internet" in k or "lan" in k:
+        target = by_len[0]
+        return int(target["x1"]+(target["x2"]-target["x1"])*0.1 + target["nx"]*offset),                int(target["y1"]+(target["y2"]-target["y1"])*0.1 + target["ny"]*offset)
+    elif "power" in k or "socket" in k:
+        # Розетки — распределяем по РАЗНЫМ стенам
+        # n_device-я розетка идёт на n_device-ю стену по длине
+        sorted_walls = sorted(walls, key=lambda w: w["length"], reverse=True)
+        # Берём стену по циклу — каждая следующая розетка на другой стене
+        wall_idx = n_device % len(sorted_walls)
+        target = sorted_walls[wall_idx]
+        # Позиция вдоль стены — чередуем начало/середину/конец
+        pos_t = [0.25, 0.75, 0.5, 0.15, 0.85]
+        t = pos_t[(n_device // len(sorted_walls)) % len(pos_t)]
+        return int(target["x1"]+(target["x2"]-target["x1"])*t + target["nx"]*offset),                int(target["y1"]+(target["y2"]-target["y1"])*t + target["ny"]*offset)
+    else:
+        return int(room_cx), int(room_cy)
+
+
 def _to_design_graph(
     placement:  Dict[str, Dict[str, int]],
     nodes:      List[Dict],
     project_id: str,
 ) -> Dict[str, Any]:
-    """Конвертирует предсказания в формат DesignGraph."""
+    """Конвертирует предсказания в формат DesignGraph с координатами на стенах."""
     devices_list = []
     room_designs = []
+
+    # Строим карту room_id → (centroid, polygon)
+    node_map = {n["room_id"]: n for n in nodes}
 
     for node in nodes:
         room_id   = node["room_id"]
         room_type = node["room_type"]
         counts    = placement.get(room_id, {})
         device_ids = []
+        poly      = node.get("polygonPx") or []
+        # Центроид — из centroidPx или вычисляем из bbox
+        cp = node.get("centroidPx") or []
+        if cp and len(cp) >= 2:
+            cx, cy = float(cp[0]), float(cp[1])
+        elif poly:
+            xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
+            cx, cy = sum(xs)/len(xs), sum(ys)/len(ys)
+        else:
+            cx, cy = 0.0, 0.0
 
         for device, count in counts.items():
             for k in range(count):
                 dev_id = f"{room_id}_{device}_{k}"
-                devices_list.append({
+                px, py = _wall_point(device, poly, cx, cy, offset=22, n_device=k)
+                dev_entry = {
                     "id":       dev_id,
                     "kind":     device,
                     "roomRef":  room_id,
-                    "mount":    "ceiling" if device == "ceiling_light" else "wall",
-                    "heightMm": 0 if device == "ceiling_light" else 300,
+                    "mount":    "ceiling" if "light" in device else "wall",
+                    "heightMm": 0 if "light" in device else 300,
                     "label":    device.replace("_", " ").title(),
                     "reason":   "NN-3 prediction",
-                })
+                }
+                if px is not None:
+                    # Clamp внутри bbox комнаты
+                    px, py = _clamp_to_bbox(px, py, poly, margin=12)
+                    dev_entry["xPx"] = px
+                    dev_entry["yPx"] = py
+                devices_list.append(dev_entry)
                 device_ids.append(dev_id)
 
         room_designs.append({
@@ -164,6 +286,8 @@ def run_placement(
             "room_id":    room.get("id", str(uuid.uuid4())),
             "room_type":  room.get("roomType", "unknown"),
             "area_m2":    room.get("areaM2") or 10.0,
+            "polygonPx":  room.get("polygonPx") or [],
+            "centroidPx": room.get("centroidPx") or [],
             "n_windows":  sum(1 for o in plan_graph.get("openings", [])
                              if o.get("kind") == "window"
                              and room.get("id") in o.get("roomRefs", [])),
@@ -218,3 +342,14 @@ def run_placement(
             placement[node["room_id"]] = result
 
     return _to_design_graph(placement, nodes, project_id)
+
+
+def _clamp_to_bbox(px: int, py: int, poly: list, margin: int = 10):
+    """Ограничиваем координаты внутри bbox полигона с отступом."""
+    if not poly or len(poly) < 3:
+        return px, py
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    x0, x1 = min(xs) + margin, max(xs) - margin
+    y0, y1 = min(ys) + margin, max(ys) - margin
+    return int(max(x0, min(x1, px))), int(max(y0, min(y1, py)))

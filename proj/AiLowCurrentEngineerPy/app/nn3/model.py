@@ -40,7 +40,7 @@ N_PREF_FEATS  = len(DEVICES)      # 6 — пожелания по каждому
 N_NODE_FEATS  = N_ROOM_TYPES + N_EXTRA_FEATS + N_PREF_FEATS  # = 17
 
 MAX_ROOMS     = 12   # максимум комнат в квартире
-MAX_DEVICE    = 4    # максимальное количество устройств одного типа
+MAX_DEVICE    = 12   # максимальное количество устройств одного типа (до 10 SVT + запас)
 
 ROOM_TYPE_IDX = {r: i for i, r in enumerate(ROOM_TYPES)}
 

@@ -31,6 +31,7 @@ from app.artifacts_index import build_artifacts_index, build_artifacts_manifest
 # NN-2: парсинг пожеланий клиента
 try:
     from app.nn2.infer import parse_text as nn2_parse_text
+
     _NN2_AVAILABLE = True
 except Exception as _nn2_err:
     _NN2_AVAILABLE = False
@@ -40,6 +41,7 @@ except Exception as _nn2_err:
 # NN-3: размещение устройств
 try:
     from app.nn3.infer import run_placement as nn3_run_placement
+
     _NN3_AVAILABLE = True
 except Exception as _nn3_err:
     _NN3_AVAILABLE = False
@@ -50,15 +52,19 @@ except Exception as _nn3_err:
 try:
     import torch as _torch
     import cv2 as _cv2
-    from app.ml.structure_infer import _load_checkpoint as _nn1_load_ckpt, infer_one as _nn1_infer_one, _preprocess as _nn1_preprocess
+    from app.ml.structure_infer import _load_checkpoint as _nn1_load_ckpt, infer_one as _nn1_infer_one, \
+        _preprocess as _nn1_preprocess
     from app.ml.structure_postprocess import extract_geometry as _nn1_extract_geometry
+
     _NN1_CKPT = "models/structure_rf_v4_bestreal.pt"
     _nn1_model = None
     _NN1_AVAILABLE = True
 except Exception as _nn1_err:
     import logging as _logging
+
     _logging.getLogger("planner").warning(f"NN-1 недоступна: {_nn1_err}")
     _NN1_AVAILABLE = False
+
 
 def _nn1_get_rooms(image_path: str, project_id: str) -> list:
     """Запускает NN-1 и возвращает список комнат с типами и polygonPx."""
@@ -85,12 +91,33 @@ def _nn1_get_rooms(image_path: str, project_id: str) -> list:
         for i, r in enumerate(geom.get("rooms", [])):
             contour = r.get("contour")
             poly_px = contour.reshape(-1, 2).tolist() if contour is not None else []
+            # Центроид Грина
+            _cx, _cy = 0.0, 0.0
+            if len(poly_px) >= 3:
+                import math as _m
+                _xs = [p[0] for p in poly_px];
+                _ys = [p[1] for p in poly_px]
+                _n = len(_xs);
+                _area = _acx = _acy = 0.0
+                for _j in range(_n):
+                    _jj = (_j + 1) % _n
+                    _cross = _xs[_j] * _ys[_jj] - _xs[_jj] * _ys[_j]
+                    _area += _cross;
+                    _acx += (_xs[_j] + _xs[_jj]) * _cross;
+                    _acy += (_ys[_j] + _ys[_jj]) * _cross
+                _area /= 2.0
+                if abs(_area) > 1e-6:
+                    _cx = _acx / (6 * _area);
+                    _cy = _acy / (6 * _area)
+                else:
+                    _cx, _cy = sum(_xs) / len(_xs), sum(_ys) / len(_ys)
             rooms_out.append({
-                "id":         f"room_{i:03d}",
-                "polygonPx":  poly_px,
-                "roomType":   r.get("room_type", "bedroom"),
-                "areaM2":     r.get("area_m2", 10.0),
-                "areaPx":     r.get("area_px", 0),
+                "id": f"room_{i:03d}",
+                "polygonPx": poly_px,
+                "centroidPx": [_cx, _cy],
+                "roomType": r.get("room_type", "bedroom"),
+                "areaM2": r.get("area_m2", 10.0),
+                "areaPx": r.get("area_px", 0),
                 "isExterior": r.get("room_type") in {"living_room", "bedroom", "kitchen"},
             })
         logger.info("NN-1: %d комнат для project %s", len(rooms_out), project_id)
@@ -98,7 +125,6 @@ def _nn1_get_rooms(image_path: str, project_id: str) -> list:
     except Exception as e:
         logger.warning("NN-1 extract_rooms failed: %s", e)
         return []
-
 
 
 app = FastAPI(title="Low-Current Planner")
@@ -113,12 +139,11 @@ os.makedirs(LOCAL_RAW_DIR, exist_ok=True)
 os.makedirs(LOCAL_DL_DIR, exist_ok=True)
 os.makedirs(LOCAL_EXPORT_DIR, exist_ok=True)
 
-
 # ---------------------------
 # Logging / diagnostic mode
 # ---------------------------
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "info").upper()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "debug").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("planner")
 
@@ -251,7 +276,7 @@ def _routes_to_json(routes: list[Any]) -> list[dict[str, Any]]:
 
 def _strip_bucket_prefix(key: str, bucket: str) -> str:
     if key.startswith(f"{bucket}/"):
-        return key[len(bucket) + 1 :]
+        return key[len(bucket) + 1:]
     return key
 
 
@@ -417,16 +442,16 @@ def health_s3():
         ok = CLIENT.bucket_exists(RAW_BUCKET)
         internal = os.getenv("S3_ENDPOINTPY", "minio:9000")
         public = (
-            os.getenv("S3_PUBLIC_ENDPOINT")
-            or os.getenv("S3_PUBLIC_ENDPOINTPY")
-            or internal
+                os.getenv("S3_PUBLIC_ENDPOINT")
+                or os.getenv("S3_PUBLIC_ENDPOINTPY")
+                or internal
         )
 
         warning = None
         if (
-            ("minio" in str(public).lower())
-            and not os.getenv("S3_PUBLIC_ENDPOINT")
-            and not os.getenv("S3_PUBLIC_ENDPOINTPY")
+                ("minio" in str(public).lower())
+                and not os.getenv("S3_PUBLIC_ENDPOINT")
+                and not os.getenv("S3_PUBLIC_ENDPOINTPY")
         ):
             warning = "S3_PUBLIC_ENDPOINT is not set; presigned URLs may use internal host (e.g., minio:9000) and may not open in browser. Set S3_PUBLIC_ENDPOINT=localhost:9000 for local dev."
 
@@ -440,6 +465,84 @@ def health_s3():
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def _make_numbered_plan(image_path: str, rooms: list, project_id: str) -> tuple:
+    """
+    Рисует поверх плана номера комнат (1, 2, 3...) в центре каждой.
+    Возвращает (local_path, s3_uri, room_map) где room_map = {номер: room_id}
+    """
+    import cv2, numpy as np, os
+    img = cv2.imread(image_path)
+    if img is None:
+        return None, None, {}
+
+    h, w = img.shape[:2]
+    font = cv2.FONT_HERSHEY_DUPLEX
+    room_map = {}  # {1: "room_000", 2: "room_001", ...}
+    colors = [
+        (220, 80, 80), (80, 150, 220), (80, 200, 80),
+        (200, 160, 40), (160, 80, 200), (40, 200, 200),
+        (220, 120, 40), (120, 220, 120), (80, 80, 200),
+        (200, 80, 160),
+    ]
+
+    for i, room in enumerate(rooms):
+        num = i + 1
+        room_id = room.get("id") or f"room_{i:03d}"
+        room_map[num] = room_id
+        poly = room.get("polygonPx") or []
+        if len(poly) < 3:
+            continue
+
+        # Центроид
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        cx = int(sum(xs) / len(xs))
+        cy = int(sum(ys) / len(ys))
+
+        color = colors[i % len(colors)]
+        label = str(num)
+
+        # Полупрозрачная заливка полигона
+        pts = np.array(poly, dtype=np.int32).reshape((-1, 1, 2))
+        mask = img.copy()
+        cv2.fillPoly(mask, [pts], color)
+        img = cv2.addWeighted(img, 0.75, mask, 0.25, 0)
+
+        # Контур
+        cv2.polylines(img, [pts], isClosed=True, color=color, thickness=2)
+
+        # Номер — белый текст с тёмной обводкой
+        fs = max(0.8, min(2.0, (max(max(xs) - min(xs), max(ys) - min(ys))) / 200))
+        thick = max(2, int(fs * 2.5))
+        (tw, th), _ = cv2.getTextSize(label, font, fs, thick)
+        tx, ty = cx - tw // 2, cy + th // 2
+        # Обводка
+        cv2.putText(img, label, (tx, ty), font, fs, (0, 0, 0), thick + 2, cv2.LINE_AA)
+        # Текст
+        cv2.putText(img, label, (tx, ty), font, fs, (255, 255, 255), thick, cv2.LINE_AA)
+
+        # Площадь под номером
+        area = room.get("areaM2") or 0
+        if area:
+            alabel = f"{area:.0f}m2"
+            afs = fs * 0.55
+            (aw, ah), _ = cv2.getTextSize(alabel, font, afs, 1)
+            cv2.putText(img, alabel, (cx - aw // 2, cy + th + 5), font, afs, (30, 30, 30), 1, cv2.LINE_AA)
+
+    out_path = f"/tmp/exports/{project_id}_numbered.png"
+    os.makedirs("/tmp/exports", exist_ok=True)
+    cv2.imwrite(out_path, img)
+
+    # Загружаем в MinIO
+    s3_key = f"previews/{project_id}_numbered.png"
+    try:
+        uri = upload_file(EXPORT_BUCKET, out_path, s3_key)
+    except Exception:
+        uri = None
+
+    return out_path, uri, room_map
 
 
 @app.post("/ingest")
@@ -471,7 +574,49 @@ async def ingest(req: APIIngestRequest):
     else:
         raise HTTPException(status_code=415, detail="Unsupported file type (expected .dxf/.dwg/.png/.jpg/.jpeg)")
 
-    return {"project_id": req.project_id, **stats}
+    # NN-1: запускаем сегментацию и нумеруем комнаты
+    numbered_url = None
+    room_map = {}
+    nn1_rooms = []
+
+    if low.endswith((".png", ".jpg", ".jpeg")):
+        nn1_rooms = _nn1_get_rooms(local_path, req.project_id)
+        if nn1_rooms:
+            DB.setdefault("rooms", {})[req.project_id] = nn1_rooms
+            _, numbered_url, room_map = _make_numbered_plan(local_path, nn1_rooms, req.project_id)
+            DB.setdefault("room_map", {})[req.project_id] = room_map
+            logger.info("Ingest room_map: %s", {k: v for k, v in room_map.items()})
+            logger.info("Ingest: NN-1 нашла %d комнат, numbered plan создан", len(nn1_rooms))
+
+    # Генерируем preview зон освещения
+    try:
+        from app.export_overlay_png import export_zones_preview
+        zones_path = f"/tmp/exports/{req.project_id}_zones.png"
+        export_zones_preview(local_path, nn1_rooms, zones_path)
+        # Загружаем в MinIO
+        _zones_uri = upload_file(EXPORT_BUCKET, zones_path, f"previews/{req.project_id}_zones.png")
+        logger.info("Zones preview: %s", _zones_uri)
+    except Exception as _ze:
+        logger.debug("Zones preview failed: %s", _ze)
+
+    # Строим краткое описание комнат для пользователя
+    rooms_info = []
+    for i, r in enumerate(nn1_rooms):
+        rooms_info.append({
+            "num": i + 1,
+            "room_id": r.get("id"),
+            "room_type": r.get("roomType", "?"),
+            "area_m2": r.get("areaM2", 0),
+        })
+
+    return {
+        "project_id": req.project_id,
+        "rooms_found": len(nn1_rooms),
+        "rooms": rooms_info,
+        "numbered_plan": numbered_url,
+        "hint": "Посмотри на numbered_plan и в /design укажи: \"1: свет датчик дыма; 2: телевизор свет; 3: свет\"",
+        **stats,
+    }
 
 
 @app.post("/place")
@@ -502,17 +647,17 @@ async def route(req: APIRouteRequest):
 @app.post("/export")
 async def export(req: APIExportRequest):
     try:
-        routes  = DB.get("routes",  {}).get(req.project_id, [])
+        routes = DB.get("routes", {}).get(req.project_id, [])
 
         # ── 1. Комнаты: объединяем геометрию из DB["rooms"] с типами из DesignGraph ──
-        legacy_rooms  = DB.get("rooms",  {}).get(req.project_id, []) or []
-        design_graph  = DB.get("design", {}).get(req.project_id)
+        legacy_rooms = DB.get("rooms", {}).get(req.project_id, []) or []
+        design_graph = DB.get("design", {}).get(req.project_id)
 
         # Строим map room_id → roomType из DesignGraph.roomDesigns
         room_type_map: dict = {}
         if design_graph:
             for rd in design_graph.get("roomDesigns", []):
-                rid   = rd.get("roomId", "")
+                rid = rd.get("roomId", "")
                 rtype = rd.get("roomType", "bedroom")
                 if rid:
                     room_type_map[rid] = rtype
@@ -550,22 +695,31 @@ async def export(req: APIExportRequest):
 
         rooms = []
         for i, (r, area_m2) in enumerate(filtered):
-            rid   = r.get("id") or f"room_{i:03d}"
+            rid = r.get("id") or f"room_{i:03d}"
             rtype = room_type_map.get(rid) or ROOM_TYPES_CYCLE[i % len(ROOM_TYPES_CYCLE)]
+            # Коррекция: если NN-1 классифицировала как kitchen но площадь < 10m² → скорее всего балкон/лоджия
+            if rtype == "kitchen" and area_m2 < 10:
+                rtype = "balcony"
             rooms.append({**r, "id": rid, "roomType": rtype, "areaM2": area_m2})
 
         # ── 2. Устройства из DesignGraph с room_id (без координат — export_pdf сам считает центроид) ──
         if design_graph and "devices" in design_graph:
             devices = []
             for d in design_graph["devices"]:
-                devices.append({
-                    "kind":    d.get("kind", "UNKNOWN"),
-                    "type":    d.get("kind", "UNKNOWN"),   # legacy compat
-                    "label":   d.get("label", ""),
+                dev_entry = {
+                    "kind": d.get("kind", "UNKNOWN"),
+                    "type": d.get("kind", "UNKNOWN"),  # legacy compat
+                    "label": d.get("label", ""),
                     "roomRef": d.get("roomRef", ""),
-                    "room_id": d.get("roomRef", ""),       # legacy compat
-                    # x/y НЕ передаём — export_pdf вычислит из центроида полигона
-                })
+                    "room_id": d.get("roomRef", ""),  # legacy compat
+                    "id": d.get("id", ""),
+                    "reason": d.get("reason", ""),
+                }
+                # Передаём координаты если есть (для PNG overlay)
+                if d.get("xPx") is not None:
+                    dev_entry["xPx"] = d["xPx"]
+                    dev_entry["yPx"] = d["yPx"]
+                devices.append(dev_entry)
         else:
             devices = _devices_to_json(DB.get("devices", {}).get(req.project_id, []))
 
@@ -576,13 +730,27 @@ async def export(req: APIExportRequest):
         keys: List[str] = []
 
         # Источник для overlay PNG
-        src_key = (DB.get("source", {}).get(req.project_id) or {}).get("src_key")
+        _src_info = DB.get("source", {}).get(req.project_id) or {}
         local_src_png: Optional[str] = None
-        if src_key:
-            try:
-                local_src_png = _ensure_png_path(_download_from_raw(src_key))
-            except Exception:
-                local_src_png = None
+        # 1. Кэш — local_path сохранён при /ingest
+        _lp = _src_info.get("local_path")
+        if _lp and osp.exists(_lp):
+            local_src_png = _ensure_png_path(_lp)
+        # 2. Fallback — numbered plan уже лежит в /tmp/exports
+        if not local_src_png:
+            _numbered = f"/tmp/exports/{req.project_id}_numbered.png"
+            if osp.exists(_numbered):
+                local_src_png = _numbered
+        # 3. Fallback — скачать из MinIO
+        if not local_src_png:
+            src_key = req.src_s3_key if hasattr(req, "src_s3_key") else None
+            src_key = src_key or _src_info.get("src_key")
+            if src_key:
+                try:
+                    local_src_png = _ensure_png_path(_download_from_raw(src_key))
+                except Exception:
+                    local_src_png = None
+        logger.info("Export PNG: base image = %s", local_src_png or "NONE → canvas fallback")
 
         if "DXF" in req.formats:
             dxf_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}.dxf"
@@ -597,19 +765,26 @@ async def export(req: APIExportRequest):
         if "PNG" in req.formats:
             try:
                 png_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}_overlay.png"
-                # Передаём комнаты с polygonPx для центроидов
-                # Приоритет: DB["rooms"] после NN-1 (содержат polygonPx + roomType)
+                # Используем DB["rooms"] — там есть polygonPx от NN-1
                 db_rooms = DB.get("rooms", {}).get(req.project_id, []) or []
-                rooms_with_poly = db_rooms if db_rooms else (legacy_rooms if legacy_rooms else rooms)
+                rooms_with_poly = db_rooms if db_rooms else rooms
+                _with_poly_count = sum(
+                    1 for r in rooms_with_poly if r.get("polygonPx") and len(r.get("polygonPx", [])) >= 3)
+                logger.info("PNG export: %d rooms, %d with polygonPx, base=%s",
+                            len(rooms_with_poly), _with_poly_count, local_src_png or "None")
                 if local_src_png and osp.exists(local_src_png):
                     export_overlay_png(local_src_png, rooms_with_poly, devices, routes, png_path)
                 else:
-                    export_preview_canvas_png(
-                        rooms=rooms_with_poly, devices=devices, routes=routes, out_path=png_path
-                    )
+                    # Нет фонового изображения — numbered plan как база
+                    _numbered = f"/tmp/exports/{req.project_id}_numbered.png"
+                    if osp.exists(_numbered):
+                        export_overlay_png(_numbered, rooms_with_poly, devices, routes, png_path)
+                    else:
+                        export_preview_canvas_png(rooms=rooms_with_poly, devices=devices,
+                                                  routes=routes, out_path=png_path)
                 out_paths.append(png_path)
             except Exception as e:
-                logger.warning("PNG export failed: %s", e)
+                logger.warning("PNG export failed: %s", e, exc_info=True)
 
         for p in out_paths:
             key = f"drawings/{osp.basename(p)}"
@@ -656,22 +831,530 @@ async def preferences_parse(req: PreferencesParseRequest):
 
 class DesignRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
-    project_id:       str            = Field(validation_alias=AliasChoices("projectId", "project_id"))
-    preferences_text: Optional[str]  = Field(default=None, validation_alias=AliasChoices("preferencesText", "preferences_text"))
-
+    project_id: str = Field(validation_alias=AliasChoices("projectId", "project_id"))
+    preferences_text: Optional[str] = Field(default=None,
+                                            validation_alias=AliasChoices("preferencesText", "preferences_text"))
 
 
 @app.get("/debug/db/{project_id}", tags=["debug"])
 async def debug_db(project_id: str):
     """Показывает что лежит в DB для project_id."""
     return {
-        "has_rooms":      bool(DB.get("rooms", {}).get(project_id)),
-        "n_rooms":        len(DB.get("rooms", {}).get(project_id) or []),
+        "has_rooms": bool(DB.get("rooms", {}).get(project_id)),
+        "n_rooms": len(DB.get("rooms", {}).get(project_id) or []),
         "has_plan_graph": bool(DB.get("plan_graph", {}).get(project_id)),
-        "has_preferences":bool(DB.get("preferences", {}).get(project_id)),
-        "rooms_sample":   (DB.get("rooms", {}).get(project_id) or [])[:2],
-        "db_keys":        list(DB.keys()),
+        "has_preferences": bool(DB.get("preferences", {}).get(project_id)),
+        "rooms_sample": (DB.get("rooms", {}).get(project_id) or [])[:2],
+        "db_keys": list(DB.keys()),
     }
+
+
+def _parse_numbered_preferences(text: str, room_map: dict) -> dict:
+    """
+    Парсит текст вида:
+      "1: телевизор, свет; 2: свет, 2 ночника, телевизор; 3: свет, датчик дыма; 4: 2-4 источника света, интернет"
+
+    Поддерживает:
+      - "2 ночника"           → night_lights: 2
+      - "2-4 источника света" → ceiling_lights: 3  (берём среднее)
+      - "телевизор"           → tv_sockets: 1
+      - запятые и пробелы как разделители внутри комнаты
+      - ";" или "\n" как разделители между комнатами
+
+    room_map: {1: "room_000", 2: "room_001", ...}
+    """
+
+    # Устройства: список (паттерн_regex, device_key)
+    # Порядок важен — длинные паттерны раньше коротких
+    DEVICE_PATTERNS = [
+        (r"датчик\s*дыма", "smoke_detector"),
+        (r"датчик\s*co2", "co2_detector"),
+        (r"датчик\s*угарного", "co2_detector"),
+        (r"углекислый", "co2_detector"),
+        (r"co2", "co2_detector"),
+        (r"газовый\s*датчик", "co2_detector"),
+        (r"источник(?:а|ов)?\s*света", "ceiling_lights"),
+        (r"светильник(?:а|ов)?", "ceiling_lights"),
+        (r"люстр(?:а|ы)?", "ceiling_lights"),
+        (r"лампоч(?:ка|ки|ек)?", "ceiling_lights"),
+        (r"свет(?:овых|овые)?", "ceiling_lights"),
+        # [DISABLED] (r"ночник(?:а|ов)?",             "night_lights"),
+        (r"подсветк(?:а|и)?", "night_lights"),
+        (r"розетк(?:а|и|у|ой)?", "power_socket"),
+        (r"\bsocket\b", "power_socket"),
+        # [DISABLED] (r"телевизор(?:а)?",             "tv_sockets"),
+        (r"тв\b", "tv_sockets"),
+        (r"\btv\b", "tv_sockets"),
+        (r"интернет", "internet_sockets"),
+        (r"роутер", "internet_sockets"),
+        (r"\blan\b", "internet_sockets"),
+        (r"вайфай", "internet_sockets"),
+        (r"\bwifi\b", "internet_sockets"),
+        (r"дым\b", "smoke_detector"),
+        (r"пожарн", "smoke_detector"),
+    ]
+
+    def _parse_count(token: str) -> int:
+        """Извлекает число из токена: '2', '2-4' → среднее=3, 'два'=2 и т.д."""
+        WORDS = {"один": 1, "одна": 1, "одного": 1, "два": 2, "две": 2, "трёх": 3, "три": 3,
+                 "четыре": 4, "четырёх": 4, "пять": 5}
+        t = token.strip().lower()
+        # диапазон "2-4"
+        m = import_re.match(r"(\d+)\s*[-–—]\s*(\d+)", t)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            return max(1, round((a + b) / 2))
+        # просто число
+        m = import_re.match(r"(\d+)", t)
+        if m:
+            return max(1, int(m.group(1)))
+        # слово
+        for w, n in WORDS.items():
+            if w in t:
+                return n
+        return 1
+
+    def _parse_room_segment(seg: str) -> dict:
+        """Парсит строку одной комнаты → {device: count}"""
+        result = {}
+        seg_lo = seg.lower()
+
+        for pattern, device in DEVICE_PATTERNS:
+            # Ищем все вхождения паттерна
+            for m in import_re.finditer(pattern, seg_lo):
+                start = m.start()
+                # Смотрим что стоит ПЕРЕД паттерном (число/диапазон)
+                prefix = seg_lo[max(0, start - 12):start].strip()
+                # Убираем запятые и лишнее
+                prefix = import_re.sub(r"[,;]", " ", prefix).strip()
+                # Берём последний токен перед паттерном
+                tokens = prefix.split()
+                count = 1
+                if tokens:
+                    count = _parse_count(tokens[-1])
+
+                result[device] = max(result.get(device, 0), count)
+
+        return result
+
+    # Разбиваем на сегменты по ";" или "\n"
+    segments = [s.strip() for s in import_re.split(r"[;\n]", text) if s.strip()]
+    rooms_prefs = {}
+
+    for seg in segments:
+        # Ищем номер комнаты в начале: "1:", "комната 2:", "1 -"
+        m = import_re.match(
+            r"(?:комната\s*)?(\d+)\s*[:\-–—]?\s*(.*)",
+            seg.strip(), import_re.IGNORECASE | import_re.DOTALL
+        )
+        if not m:
+            continue
+        num = int(m.group(1))
+        room_body = m.group(2).strip()
+        room_id = room_map.get(num)
+        if not room_id or not room_body:
+            continue
+
+        devs = _parse_room_segment(room_body)
+        if devs:
+            rooms_prefs[room_id] = devs
+
+    rooms_list = [{"roomId": rid, "devices": devs} for rid, devs in rooms_prefs.items()]
+
+    return {
+        "version": "preferences-1.0",
+        "sourceText": text,
+        "global": {},
+        "rooms": rooms_list,
+        "_by_room_id": rooms_prefs,
+    }
+
+
+import re as import_re
+
+
+def _point_in_polygon(px: float, py: float, poly: list) -> bool:
+    """Ray casting — точка внутри полигона."""
+    n = len(poly)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = float(poly[i][0]), float(poly[i][1])
+        xj, yj = float(poly[j][0]), float(poly[j][1])
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _svt_grid_positions(poly: list, area_m2: float, room_type: str = "living_room") -> list:
+    """
+    Возвращает список (px, py) центров зон освещения.
+    Использует те же зоны что и export_zones_preview — единый алгоритм.
+    """
+    if not poly or len(poly) < 3:
+        return []
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    w, h = x1 - x0, y1 - y0
+
+    # Количество по норме
+    if room_type in ("bathroom", "toilet", "balcony"):
+        needed = 1
+    elif room_type == "corridor":
+        needed = max(1, min(4, round(area_m2 / 8.0)))
+    elif room_type == "kitchen":
+        needed = max(1, min(4, round(area_m2 / 10.0)))
+    else:
+        needed = max(1, min(8, round(area_m2 / 16.0)))
+
+    # Сетка cols×rows
+    aspect = w / max(1.0, h)
+    if needed == 1:
+        cols, rows = 1, 1
+    elif needed == 2:
+        cols, rows = (2, 1) if aspect >= 1.0 else (1, 2)
+    elif needed <= 4:
+        cols, rows = 2, 2
+    elif needed <= 6:
+        cols, rows = (3, 2) if aspect >= 1.0 else (2, 3)
+    else:
+        cols, rows = (3, 3) if needed <= 9 else (4, 3)
+
+    # Используем те же зоны что рисуются в zones preview
+    try:
+        from app.export_overlay_png import _build_lighting_zones
+        zones = _build_lighting_zones(poly, area_m2, room_type)
+        positions = [z["center"] for z in zones]
+        if positions:
+            return positions
+    except Exception:
+        pass
+
+    # Fallback — центр комнаты
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    return [(int(sum(xs) / len(xs)), int(sum(ys) / len(ys)))]
+
+
+def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: list = None) -> dict:
+    """
+    Постпроцессинг после NN-3: применяем жёсткие правила которые нельзя нарушать.
+
+    Правила:
+    - internet_sockets: ОДИН на всю квартиру (corridor или living_room)
+    - smoke_detector: НЕ ставим на кухне и в санузлах
+    - co2_detector: ТОЛЬКО кухня (и гостиная по желанию)
+    - night_lights: ТОЛЬКО спальня и коридор
+    - tv_sockets: НЕ ставим в corridor/bathroom/toilet/kitchen
+    """
+    forced_devices = forced_devices or {}
+
+    NO_SMOKE = {"kitchen", "bathroom", "toilet", "balcony"}
+    NO_CO2 = {"bedroom", "bathroom", "toilet", "corridor", "balcony"}
+    NO_NIGHT = {"living_room", "kitchen", "bathroom", "toilet"}
+    NO_TV = {"corridor", "bathroom", "toilet"}
+    NO_SOCKET = {"bathroom", "toilet", "balcony"}
+    ONLY_LIGHT = {"bathroom", "toilet", "balcony"}  # только свет, ничего другого
+    DISABLED_DEVICES = {"tv_sockets", "night_lights"}  # временно отключены
+
+    devices = design_graph.get("devices", [])
+    room_designs = design_graph.get("roomDesigns", [])
+
+    # Карта roomId → roomType с коррекцией балкона
+    # Берём площадь из переданных rooms
+    room_areas = {}
+    for r in (rooms or []):
+        if isinstance(r, dict):
+            _rid = r.get("id") or r.get("roomId") or r.get("room_id") or ""
+            if isinstance(_rid, int):
+                _rid = f"room_{_rid:03d}"
+            _area = r.get("areaM2") or r.get("area_m2") or 999
+            if _rid:
+                room_areas[_rid] = float(_area)
+    for rd in room_designs:
+        rid = rd["roomId"]
+        if rid not in room_areas:
+            room_areas[rid] = rd.get("areaM2") or rd.get("area_m2") or 999
+
+    room_type_map = {}
+    for rd in room_designs:
+        rid = rd["roomId"]
+        rtype = rd.get("roomType", "bedroom")
+        area = room_areas.get(rid, 999)
+        # Коррекция: маленькая "кухня" (< 10 m²) → балкон/лоджия
+        if rtype == "kitchen" and area < 10:
+            rtype = "balcony"
+            logger.debug("Hard rules: %s reclassified kitchen→balcony (area=%.1f m²)", rid, area)
+        room_type_map[rid] = rtype
+
+    # Найдём комнату для роутера: corridor > living_room
+    internet_room = None
+    for priority in ["corridor", "living_room"]:
+        for rd in room_designs:
+            if rd.get("roomType") == priority:
+                internet_room = rd["roomId"]
+                break
+        if internet_room:
+            break
+    if not internet_room and room_designs:
+        internet_room = room_designs[0]["roomId"]
+
+    # Фильтруем устройства
+    filtered_devices = []
+    internet_placed = False
+
+    for d in devices:
+        kind = d.get("kind", "")
+        # Временно отключённые устройства
+        if kind in DISABLED_DEVICES:
+            continue
+        room_id = d.get("roomRef", "") or d.get("room_id", "")
+        rtype = room_type_map.get(room_id, "bedroom")
+
+        # Санузел/туалет — только ceiling_lights
+        if rtype in ONLY_LIGHT and kind != "ceiling_lights":
+            continue
+
+        # Датчик дыма — не на кухне и не в санузлах
+        if kind == "smoke_detector" and rtype in NO_SMOKE:
+            continue
+
+        # CO2 — только кухня
+        if kind == "co2_detector" and rtype in NO_CO2:
+            continue
+
+        # Ночник — только спальня и коридор
+        if kind == "night_lights" and rtype in NO_NIGHT:
+            continue
+
+        # TV — не в коридоре/санузле
+        if kind == "power_socket" and rtype in NO_SOCKET:
+            continue
+        if kind == "tv_sockets" and rtype in NO_TV:
+            continue
+
+        # LAN — строго одна на квартиру
+        # forced устройства (явный запрос пользователя) имеют приоритет над auto-placed
+        if kind == "internet_sockets":
+            is_forced = d.get("reason") == "user request"
+            if internet_placed:
+                # Если уже есть LAN и это не forced — пропускаем
+                if not is_forced:
+                    continue
+                # Если forced — заменяем предыдущий auto-placed LAN
+                filtered_devices = [x for x in filtered_devices if x.get("kind") != "internet_sockets"]
+                internet_placed = False
+            internet_placed = True
+
+        filtered_devices.append(d)
+
+    # Добавляем устройства явно запрошенные пользователем по номеру комнаты
+    existing_ids = {d["id"] for d in filtered_devices}
+    # Строим карту room_id → (polygonPx, centroidPx) для wall placement
+    from app.nn3.infer import _wall_point as _wp
+    _room_geo = {}
+    for r in (rooms or []):
+        if not isinstance(r, dict):
+            continue
+        _rid = r.get("id") or r.get("roomId") or r.get("room_id") or ""
+        if isinstance(_rid, int):
+            _rid = f"room_{_rid:03d}"
+        _poly = r.get("polygonPx") or []
+        _cp = r.get("centroidPx") or []
+        if _poly:
+            if _cp and len(_cp) >= 2:
+                _cx, _cy = float(_cp[0]), float(_cp[1])
+            else:
+                _xs = [p[0] for p in _poly];
+                _ys = [p[1] for p in _poly]
+                _cx, _cy = sum(_xs) / len(_xs), sum(_ys) / len(_ys)
+            _room_geo[_rid] = (_poly, _cx, _cy)
+
+    for room_id, devs in forced_devices.items():
+        rtype = room_type_map.get(room_id, "bedroom")
+        for device, count in devs.items():
+            if count <= 0:
+                continue
+            # Проверяем жёсткие запреты
+            if device == "smoke_detector" and rtype in NO_SMOKE:
+                continue
+            if device == "co2_detector" and rtype in NO_CO2:
+                continue
+            # Убираем старые устройства этого типа в этой комнате и ставим нужное кол-во
+            filtered_devices = [d for d in filtered_devices
+                                if not (d.get("roomRef") == room_id and d.get("kind") == device)]
+            for k in range(int(count)):
+                dev_id = f"{room_id}_{device}_{k}_forced"
+                if dev_id not in existing_ids:
+                    dev_entry = {
+                        "id": dev_id,
+                        "kind": device,
+                        "roomRef": room_id,
+                        "room_id": room_id,
+                        "mount": "wall",
+                        "heightMm": 300,
+                        "label": device.replace("_", " ").title(),
+                        "reason": "user request",
+                    }
+                    # Добавляем координаты wall placement
+                    if room_id in _room_geo:
+                        _poly, _cx, _cy = _room_geo[room_id]
+                        _px, _py = _wp(device, _poly, _cx, _cy, offset=22, n_device=k)
+                        if _px is not None:
+                            # Clamp внутри bbox комнаты
+                            if _poly:
+                                _xs = [p[0] for p in _poly];
+                                _ys = [p[1] for p in _poly]
+                                _x0, _x1 = min(_xs) + 12, max(_xs) - 12
+                                _y0, _y1 = min(_ys) + 12, max(_ys) - 12
+                                _px = int(max(_x0, min(_x1, _px)))
+                                _py = int(max(_y0, min(_y1, _py)))
+                            dev_entry["xPx"] = _px
+                            dev_entry["yPx"] = _py
+                    filtered_devices.append(dev_entry)
+
+    # Если LAN не попал автоматически — добавляем в living_room/corridor
+    if not internet_placed and internet_room:
+        filtered_devices.append({
+            "id": f"{internet_room}_internet_sockets_0",
+            "kind": "internet_sockets",
+            "roomRef": internet_room,
+            "room_id": internet_room,
+            "mount": "wall",
+            "heightMm": 300,
+            "label": "Internet Sockets",
+            "reason": "rule: one LAN per apartment",
+        })
+
+    # ── Нормативная коррекция количества SVT по СП 52.13330 ─────────────────
+    # Если NN-3 поставила меньше светильников чем нужно по норме — добавляем
+    room_area_map = {}
+    for r in (rooms or []):
+        if not isinstance(r, dict):
+            continue
+        _rid = r.get("id") or r.get("roomId") or r.get("room_id") or ""
+        if isinstance(_rid, int):
+            _rid = f"room_{_rid:03d}"
+        _area = float(r.get("areaM2") or r.get("area_m2") or 0)
+        if _rid:
+            room_area_map[_rid] = _area
+
+    import math as _math
+    for room_id, rtype in room_type_map.items():
+        if rtype in ("bathroom", "toilet", "balcony"):
+            continue
+        area = room_area_map.get(room_id, 0)
+        if area <= 0:
+            continue
+
+        # Получаем polygonPx комнаты
+        _room_poly_norm = []
+        for _r in (rooms or []):
+            if not isinstance(_r, dict):
+                continue
+            _rid_raw = _r.get("id") or _r.get("room_id") or ""
+            _rid_norm = f"room_{_rid_raw:03d}" if isinstance(_rid_raw, int) else str(_rid_raw)
+            if _rid_norm == room_id:
+                _room_poly_norm = _r.get("polygonPx") or []
+                break
+
+        # Вычисляем оптимальные позиции SVT по сетке зон освещения
+        svt_positions = _svt_grid_positions(_room_poly_norm, area, rtype)
+        needed_svt = len(svt_positions)
+
+        if _room_poly_norm and needed_svt > 0:
+            # Удаляем ВСЕ старые SVT этой комнаты — заменяем на zone grid
+            filtered_devices = [
+                d for d in filtered_devices
+                if not (d.get("kind") == "ceiling_lights"
+                        and (d.get("roomRef") == room_id or d.get("room_id") == room_id))
+            ]
+            # Добавляем SVT с правильными координатами зон освещения
+            for k, (px_svt, py_svt) in enumerate(svt_positions):
+                dev_id = f"{room_id}_ceiling_lights_zone_{k}"
+                filtered_devices.append({
+                    "id": dev_id,
+                    "kind": "ceiling_lights",
+                    "roomRef": room_id,
+                    "mount": "ceiling",
+                    "heightMm": 0,
+                    "label": "Ceiling Lights",
+                    "reason": f"zone: {needed_svt} SVT for {area:.0f}m²",
+                    "xPx": px_svt,
+                    "yPx": py_svt,
+                })
+
+    # ── Нормативная коррекция количества RZT по ПУЭ ──────────────────────────
+    for room_id, rtype in room_type_map.items():
+        if rtype in ("bathroom", "toilet", "corridor", "balcony"):
+            continue
+        area = room_area_map.get(room_id, 0)
+        if area <= 0:
+            continue
+
+        # ПУЭ: 1 розетка на 6м², но реально не более 6 на комнату
+        needed_rzt = max(1, min(6, round(area / 12.0)))
+
+        current_rzt = sum(
+            1 for d in filtered_devices
+            if d.get("kind") == "power_socket"
+            and (d.get("roomRef") == room_id or d.get("room_id") == room_id)
+        )
+
+        if current_rzt < needed_rzt:
+            existing_rzt_count = current_rzt
+            from app.nn3.infer import _wall_point as _wp_norm2
+            # Центроид комнаты для wall placement
+            _cx_n = sum(p[0] for p in _room_poly_norm) / len(_room_poly_norm) if _room_poly_norm else 0.0
+            _cy_n = sum(p[1] for p in _room_poly_norm) / len(_room_poly_norm) if _room_poly_norm else 0.0
+            for k in range(needed_rzt - current_rzt):
+                dev_id = f"{room_id}_power_socket_auto_{k}"
+                n_idx = existing_rzt_count + k
+                _px2, _py2 = _wp_norm2("power_socket", _room_poly_norm,
+                                       _cx_n, _cy_n, offset=22, n_device=n_idx)
+                entry = {
+                    "id": dev_id,
+                    "kind": "power_socket",
+                    "roomRef": room_id,
+                    "mount": "wall",
+                    "heightMm": 300,
+                    "label": "Power Socket",
+                    "reason": f"norm: {needed_rzt} RZT for {area:.0f}m²",
+                }
+                if _px2 is not None:
+                    entry["xPx"] = _px2
+                    entry["yPx"] = _py2
+                filtered_devices.append(entry)
+
+    # Пересчитываем deviceIds в roomDesigns
+    dev_ids_by_room: dict = {}
+    for d in filtered_devices:
+        rid = d.get("roomRef") or d.get("room_id", "")
+        dev_ids_by_room.setdefault(rid, []).append(d["id"])
+
+    new_room_designs = []
+    for rd in room_designs:
+        rid = rd["roomId"]
+        # Используем скорректированный roomType (kitchen→balcony для маленьких комнат)
+        corrected_type = room_type_map.get(rid, rd.get("roomType", "bedroom"))
+        new_room_designs.append({
+            **rd,
+            "roomType": corrected_type,
+            "deviceIds": dev_ids_by_room.get(rid, []),
+        })
+
+    design_graph = {
+        **design_graph,
+        "devices": filtered_devices,
+        "roomDesigns": new_room_designs,
+        "totalDevices": len(filtered_devices),
+        "explain": design_graph.get("explain", []) + ["Постпроцессинг: жёсткие правила применены"],
+    }
+    return design_graph
+
 
 @app.post("/design", tags=["design"])
 async def design(req: DesignRequest):
@@ -704,9 +1387,9 @@ async def design(req: DesignRequest):
                 DB.setdefault("rooms", {})[project_id] = nn1_rooms
                 plan_graph = {
                     "projectId": project_id,
-                    "rooms":     nn1_rooms,
-                    "openings":  [],
-                    "topology":  {"roomAdjacency": []},
+                    "rooms": nn1_rooms,
+                    "openings": [],
+                    "topology": {"roomAdjacency": []},
                 }
                 DB.setdefault("plan_graph", {})[project_id] = plan_graph
                 logger.info("NN-1: построен plan_graph с %d комнатами", len(nn1_rooms))
@@ -719,15 +1402,15 @@ async def design(req: DesignRequest):
             # Карта label → room_type (из geometry_png)
             LABEL_MAP = {
                 "living_room": "living_room", "гостиная": "living_room",
-                "bedroom":     "bedroom",     "спальня":  "bedroom",
-                "kitchen":     "kitchen",     "кухня":    "kitchen",
-                "bathroom":    "bathroom",    "ванная":   "bathroom",
-                "toilet":      "toilet",      "туалет":   "toilet",
-                "corridor":    "corridor",    "коридор":  "corridor",
-                "hall":        "corridor",    "прихожая": "corridor",
+                "bedroom": "bedroom", "спальня": "bedroom",
+                "kitchen": "kitchen", "кухня": "kitchen",
+                "bathroom": "bathroom", "ванная": "bathroom",
+                "toilet": "toilet", "туалет": "toilet",
+                "corridor": "corridor", "коридор": "corridor",
+                "hall": "corridor", "прихожая": "corridor",
             }
             EXT_TYPES = {"living_room", "bedroom", "kitchen"}
-            MIN_AREA_M2 = 3.0   # отфильтровываем артефакты < 3м²
+            MIN_AREA_M2 = 3.0  # отфильтровываем артефакты < 3м²
             MAX_AREA_M2 = 200.0  # включаем даже большие полигоны
             ROOM_TYPES_CYCLE = [
                 "living_room", "bedroom", "bedroom", "kitchen",
@@ -775,17 +1458,17 @@ async def design(req: DesignRequest):
                     # Назначаем тип по порядку из типичной конфигурации
                     rtype = ROOM_TYPES_CYCLE[room_idx % len(ROOM_TYPES_CYCLE)]
                 converted.append({
-                    "id":         r.get("id") or f"room_{room_idx}",
-                    "roomType":   rtype,
-                    "areaM2":     area_m2,
+                    "id": r.get("id") or f"room_{room_idx}",
+                    "roomType": rtype,
+                    "areaM2": area_m2,
                     "isExterior": rtype in EXT_TYPES,
                 })
                 room_idx += 1
             plan_graph = {
                 "projectId": project_id,
-                "rooms":     converted,
-                "openings":  [],
-                "topology":  {"roomAdjacency": []},
+                "rooms": converted,
+                "openings": [],
+                "topology": {"roomAdjacency": []},
             }
             logger.info("design: используем legacy rooms (%d комнат) для project %s",
                         len(converted), project_id)
@@ -808,9 +1491,16 @@ async def design(req: DesignRequest):
     # NN-2: парсим пожелания
     prefs_graph = DB.get("preferences", {}).get(project_id)
     if req.preferences_text:
-        prefs_graph = _parse_preferences(req.preferences_text, project_id=project_id)
+        room_map = DB.get("room_map", {}).get(project_id, {})
+        # Если есть номера комнат в тексте и room_map — используем прямой парсер
+        has_numbers = bool(room_map and import_re.search(r"\d+\s*[:–-]", req.preferences_text))
+        if has_numbers:
+            prefs_graph = _parse_numbered_preferences(req.preferences_text, room_map)
+            logger.info("NN-2: numbered preferences parsed, %d rooms", len(prefs_graph.get("rooms", [])))
+        else:
+            prefs_graph = _parse_preferences(req.preferences_text, project_id=project_id)
+            logger.info("NN-2: preferences parsed for project %s", project_id)
         DB.setdefault("preferences", {})[project_id] = prefs_graph
-        logger.info("NN-2: preferences parsed for project %s", project_id)
 
     # NN-3: размещаем устройства
     if not _NN3_AVAILABLE:
@@ -821,6 +1511,12 @@ async def design(req: DesignRequest):
         prefs_graph=prefs_graph,
         project_id=project_id,
     )
+
+    # Применяем жёсткие правила + пожелания по номерам комнат
+    by_room_id = (prefs_graph or {}).get("_by_room_id", {})
+    # Передаём rooms из DB чтобы _apply_hard_rules знал площади комнат
+    _rooms_for_rules = DB.get("rooms", {}).get(project_id, [])
+    design_graph = _apply_hard_rules(design_graph, forced_devices=by_room_id, rooms=_rooms_for_rules)
 
     # Сохраняем в DB
     DB.setdefault("design", {})[project_id] = design_graph
@@ -886,36 +1582,46 @@ async def infer(req: APIInferRequest):
         devices_json = DB.get("devices", {}).get(req.project_id, [])
         routes_json = DB.get("routes", {}).get(req.project_id, [])
 
-        # Determine source image path once
-        src_key = req.src_s3_key or (DB.get("source", {}).get(req.project_id) or {}).get("src_key")
-        local_src_png_path: Optional[str] = None
-        if src_key:
-            try:
-                local_src_path = _download_from_raw(src_key)
-                local_src_png_path = _ensure_png_path(local_src_path)
-            except Exception:
-                local_src_png_path = None
+        # Debug: логируем что имеем для экспорта
+        _rooms_with_poly = [r for r in rooms_json if r.get("polygonPx") and len(r.get("polygonPx", [])) >= 3]
+        logger.info("Export: %d rooms total, %d with polygonPx, %d devices",
+                    len(rooms_json), len(_rooms_with_poly), len(devices_json))
+        if not _rooms_with_poly and rooms_json:
+            logger.warning("Export: rooms have no polygonPx! Keys: %s",
+                           list(rooms_json[0].keys()) if rooms_json else "empty")
 
-        # --- PREVIEW PNG (ALWAYS) ---
+        # Determine source image path once
+        # 1. Сначала берём local_path из DB (быстро, без MinIO)
+        src_info = DB.get("source", {}).get(req.project_id) or {}
+        local_src_png_path: Optional[str] = None
+        _cached_local = src_info.get("local_path")
+        if _cached_local and osp.exists(_cached_local):
+            local_src_png_path = _ensure_png_path(_cached_local)
+
+        # 2. Fallback — скачиваем из MinIO
+        if not local_src_png_path:
+            src_key = req.src_s3_key or src_info.get("src_key")
+            if src_key:
+                try:
+                    local_src_path = _download_from_raw(src_key)
+                    local_src_png_path = _ensure_png_path(local_src_path)
+                except Exception:
+                    local_src_png_path = None
+
+        # --- PREVIEW PNG (ALWAYS) — используем overlay рендер (читает polygonPx) ---
         preview_key: Optional[str] = None
         try:
             preview_path = f"/tmp/preview_{req.project_id}.png"
             if local_src_png_path and osp.exists(local_src_png_path):
-                export_preview_png(
-                    base_image_path=local_src_png_path,
-                    rooms=rooms_json,
-                    devices=devices_json,
-                    routes=routes_json,
-                    out_path=preview_path,
-                )
+                export_overlay_png(local_src_png_path, rooms_json, devices_json, routes_json, preview_path)
             else:
-                export_preview_canvas_png(
-                    rooms=rooms_json,
-                    devices=devices_json,
-                    routes=routes_json,
-                    out_path=preview_path,
-                )
-
+                # Нет исходника — рисуем numbered plan как фон
+                numbered_path = f"/tmp/exports/{req.project_id}_numbered.png"
+                if osp.exists(numbered_path):
+                    export_overlay_png(numbered_path, rooms_json, devices_json, routes_json, preview_path)
+                else:
+                    export_preview_canvas_png(rooms=rooms_json, devices=devices_json,
+                                              routes=routes_json, out_path=preview_path)
             preview_key = f"exports/{req.project_id}/preview.png"
             exported_files.append(preview_path)
             uploaded_uris.append(upload_file(EXPORT_BUCKET, preview_path, preview_key))
@@ -954,15 +1660,20 @@ async def infer(req: APIInferRequest):
         if "PNG" in wants:
             try:
                 overlay_path = f"{LOCAL_EXPORT_DIR}/{req.project_id}_overlay.png"
+                # Выбираем лучший фоновый PNG: оригинал > numbered > canvas
+                _base_for_overlay = None
                 if local_src_png_path and osp.exists(local_src_png_path):
-                    export_overlay_png(local_src_png_path, rooms_json, devices_json, routes_json, overlay_path)
+                    _base_for_overlay = local_src_png_path
                 else:
-                    export_preview_canvas_png(
-                        rooms=rooms_json,
-                        devices=devices_json,
-                        routes=routes_json,
-                        out_path=overlay_path,
-                    )
+                    _numbered = f"/tmp/exports/{req.project_id}_numbered.png"
+                    if osp.exists(_numbered):
+                        _base_for_overlay = _numbered
+
+                if _base_for_overlay:
+                    export_overlay_png(_base_for_overlay, rooms_json, devices_json, routes_json, overlay_path)
+                else:
+                    export_preview_canvas_png(rooms=rooms_json, devices=devices_json,
+                                              routes=routes_json, out_path=overlay_path)
 
                 exported_files.append(overlay_path)
                 overlay_key = f"overlays/{osp.basename(overlay_path)}"
