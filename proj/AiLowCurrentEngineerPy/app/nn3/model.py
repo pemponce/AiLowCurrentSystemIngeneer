@@ -63,7 +63,7 @@ def encode_node(
     onehot[idx] = 1.0
 
     # Числовые признаки (нормализованные)
-    area     = min(node.get("area_m2", 10.0), 60.0) / 60.0
+    area     = min(node.get("area_m2", 10.0), 200.0) / 200.0  # расширен до 200m²
     n_win    = min(node.get("n_windows", 0), 5) / 5.0
     n_doors  = min(node.get("n_doors", 1), 3) / 3.0
     is_ext   = float(node.get("is_exterior", False))

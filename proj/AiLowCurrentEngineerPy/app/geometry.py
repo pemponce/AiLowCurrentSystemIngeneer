@@ -131,9 +131,6 @@ def set_geometry(
     """
     Универсальный setter, чтобы разные модули (DXF/PNG/инжестеры) могли
     задавать геометрию через единый контракт.
-
-    Поддерживает любые лишние поля через **extra:
-      set_geometry(project_id, rooms=..., walls=..., doors=..., plan_graph=..., ...)
     """
     ensure_project(project_id)
 
@@ -151,7 +148,6 @@ def set_geometry(
         DB.setdefault("source_meta", {}).setdefault(project_id, {})
         DB["source_meta"][project_id].update(source_meta)
 
-    # любые дополнительные project-scoped структуры
     for k, v in extra.items():
         if k is None:
             continue
@@ -159,7 +155,6 @@ def set_geometry(
         try:
             DB[k][project_id] = v
         except Exception:
-            # если по какой-то причине k не dict — не падаем
             pass
 
     return {
@@ -172,7 +167,6 @@ def set_geometry(
 def room_walls(room: Union[Polygon, dict, list]) -> List[LineString]:
     """
     Возвращает стены комнаты как список LineString по внешнему контуру.
-    Принимает Polygon или dict/list и приводит через coerce_polygon.
     """
     poly = room if isinstance(room, Polygon) else coerce_polygon(room)
     if poly is None:
@@ -184,9 +178,61 @@ def room_walls(room: Union[Polygon, dict, list]) -> List[LineString]:
     ]
 
 
+def detect_doorways(rooms: list, tolerance: float = 18.0) -> List[Dict]:
+    """
+    Вычисляет дверные проёмы как общие участки границ смежных комнат.
+
+    Алгоритм:
+    - Для каждой пары комнат строим Shapely Polygon
+    - Если расстояние между границами < tolerance px — это общая стена
+    - Находим ближайшие точки двух контуров → середина = центр проёма
+    - Возвращает список {"room_a", "room_b", "cx", "cy", "dist"}
+
+    Используется для SWI-выключателей когда NN-1 не возвращает doors.
+    """
+    from shapely.geometry import Polygon as ShPoly
+    from shapely.ops import nearest_points
+
+    doorways = []
+    n = len(rooms)
+    for i in range(n):
+        for j in range(i + 1, n):
+            ra = rooms[i]
+            rb = rooms[j]
+            poly_a = ra.get("polygonPx") or []
+            poly_b = rb.get("polygonPx") or []
+            if len(poly_a) < 3 or len(poly_b) < 3:
+                continue
+            try:
+                sha = ShPoly([(float(p[0]), float(p[1])) for p in poly_a])
+                shb = ShPoly([(float(p[0]), float(p[1])) for p in poly_b])
+                if not sha.is_valid:
+                    sha = sha.buffer(0)
+                if not shb.is_valid:
+                    shb = shb.buffer(0)
+                dist = sha.distance(shb)
+                if dist > tolerance:
+                    continue
+                pa, pb = nearest_points(sha.exterior, shb.exterior)
+                cx = (pa.x + pb.x) / 2
+                cy = (pa.y + pb.y) / 2
+                rid_a = ra.get("id") or ra.get("room_id") or f"room_{i:03d}"
+                rid_b = rb.get("id") or rb.get("room_id") or f"room_{j:03d}"
+                doorways.append({
+                    "room_a": rid_a,
+                    "room_b": rid_b,
+                    "cx": cx,
+                    "cy": cy,
+                    "dist": dist,
+                })
+            except Exception:
+                continue
+    return doorways
+
+
 def along_wall_points(wall: LineString, step: float = 1.5, offsets: float = 0.2):
     """
-    Генерирует точки вдоль стены через step (в тех же единицах, что и геометрия),
+    Генерирует точки вдоль стены через step,
     с отступом от углов offsets.
     """
     L = float(wall.length)

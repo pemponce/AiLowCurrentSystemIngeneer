@@ -48,14 +48,12 @@ class PlacementInfer:
         prefs = preferences or {}
         n     = min(len(nodes), MAX_ROOMS)
 
-        # Признаки узлов
         feats = torch.zeros(1, MAX_ROOMS, N_NODE_FEATS)
         for i, node in enumerate(nodes[:MAX_ROOMS]):
             rtype      = node.get("room_type", "unknown")
             room_prefs = prefs.get(rtype, {})
             feats[0, i] = torch.tensor(encode_node(node, room_prefs))
 
-        # Матрица смежности
         adj = torch.zeros(1, MAX_ROOMS, MAX_ROOMS)
         for e in edges:
             fi, ti = e["from"], e["to"]
@@ -70,8 +68,8 @@ class PlacementInfer:
         feats = feats.to(self.device)
         adj   = adj.to(self.device)
 
-        logits = self.model(feats, adj)   # (1, N, D, C)
-        preds  = logits.argmax(dim=-1)    # (1, N, D)
+        logits = self.model(feats, adj)
+        preds  = logits.argmax(dim=-1)
 
         result: Dict[str, Dict[str, int]] = {}
         for i, node in enumerate(nodes[:n]):
@@ -126,7 +124,6 @@ def _wall_point(kind: str, poly: list, room_cx: float, room_cy: float,
     h_walls = [w for w in walls if abs(w["angle"]) < 35 or abs(w["angle"]) > 145]
     k = kind.lower()
     if "ceiling" in k or "smoke" in k or "co2" in k or "motion" in k:
-        # Равномерная сетка по площади комнаты
         if poly and len(poly) >= 3:
             xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
             x0, x1 = min(xs), max(xs)
@@ -151,8 +148,6 @@ def _wall_point(kind: str, poly: list, room_cx: float, room_cy: float,
         col, row = n_device % 3, n_device // 3
         return int(room_cx + (col-1)*step), int(room_cy + (row-0.5)*step)
     elif "tv" in k:
-        # TV — самая длинная стена далеко от центроида (внешняя стена)
-        # score = length * distance_from_centroid — предпочитаем дальние длинные стены
         def _tv_score(w):
             dist = _math.hypot(w["cx"] - room_cx, w["cy"] - room_cy)
             return w["length"] * dist
@@ -163,27 +158,39 @@ def _wall_point(kind: str, poly: list, room_cx: float, room_cy: float,
         mid_y = target["y1"] + (target["y2"]-target["y1"]) * t
         return int(mid_x + target["nx"]*offset), int(mid_y + target["ny"]*offset)
     elif "night" in k:
-        # Ночник — короткая дальняя стена (изголовье кровати)
         def _nch_score(w):
             dist = _math.hypot(w["cx"] - room_cx, w["cy"] - room_cy)
             return dist / max(1.0, w["length"])
         target = max(walls, key=_nch_score)
         side = 0.25 + (n_device % 2) * 0.5
-        return int(target["x1"]+(target["x2"]-target["x1"])*side + target["nx"]*offset),                int(target["y1"]+(target["y2"]-target["y1"])*side + target["ny"]*offset)
+        return int(target["x1"]+(target["x2"]-target["x1"])*side + target["nx"]*offset), \
+               int(target["y1"]+(target["y2"]-target["y1"])*side + target["ny"]*offset)
     elif "internet" in k or "lan" in k:
         target = by_len[0]
-        return int(target["x1"]+(target["x2"]-target["x1"])*0.1 + target["nx"]*offset),                int(target["y1"]+(target["y2"]-target["y1"])*0.1 + target["ny"]*offset)
+        return int(target["x1"]+(target["x2"]-target["x1"])*0.1 + target["nx"]*offset), \
+               int(target["y1"]+(target["y2"]-target["y1"])*0.1 + target["ny"]*offset)
     elif "power" in k or "socket" in k:
-        # Розетки — распределяем по РАЗНЫМ стенам
-        # n_device-я розетка идёт на n_device-ю стену по длине
-        sorted_walls = sorted(walls, key=lambda w: w["length"], reverse=True)
-        # Берём стену по циклу — каждая следующая розетка на другой стене
-        wall_idx = n_device % len(sorted_walls)
-        target = sorted_walls[wall_idx]
-        # Позиция вдоль стены — чередуем начало/середину/конец
+        # Розетки — только на ВНЕШНИХ стенах (рёбра у периметра bbox комнаты)
+        if poly and len(poly) >= 3:
+            xs_p = [p[0] for p in poly]; ys_p = [p[1] for p in poly]
+            bx0, bx1 = min(xs_p), max(xs_p)
+            by0, by1 = min(ys_p), max(ys_p)
+            margin = 20
+            def _is_outer(w):
+                return (w["cx"] < bx0 + margin or w["cx"] > bx1 - margin or
+                        w["cy"] < by0 + margin or w["cy"] > by1 - margin)
+            outer_walls = [w for w in walls if _is_outer(w) and w["length"] >= 40]
+            if not outer_walls:
+                outer_walls = sorted(walls, key=lambda w: w["length"], reverse=True)
+        else:
+            outer_walls = sorted(walls, key=lambda w: w["length"], reverse=True)
+        sorted_outer = sorted(outer_walls, key=lambda w: w["length"], reverse=True)
+        wall_idx = n_device % len(sorted_outer)
+        target = sorted_outer[wall_idx]
         pos_t = [0.25, 0.75, 0.5, 0.15, 0.85]
-        t = pos_t[(n_device // len(sorted_walls)) % len(pos_t)]
-        return int(target["x1"]+(target["x2"]-target["x1"])*t + target["nx"]*offset),                int(target["y1"]+(target["y2"]-target["y1"])*t + target["ny"]*offset)
+        t = pos_t[(n_device // len(sorted_outer)) % len(pos_t)]
+        return int(target["x1"]+(target["x2"]-target["x1"])*t + target["nx"]*offset), \
+               int(target["y1"]+(target["y2"]-target["y1"])*t + target["ny"]*offset)
     else:
         return int(room_cx), int(room_cy)
 
@@ -197,7 +204,6 @@ def _to_design_graph(
     devices_list = []
     room_designs = []
 
-    # Строим карту room_id → (centroid, polygon)
     node_map = {n["room_id"]: n for n in nodes}
 
     for node in nodes:
@@ -206,7 +212,6 @@ def _to_design_graph(
         counts    = placement.get(room_id, {})
         device_ids = []
         poly      = node.get("polygonPx") or []
-        # Центроид — из centroidPx или вычисляем из bbox
         cp = node.get("centroidPx") or []
         if cp and len(cp) >= 2:
             cx, cy = float(cp[0]), float(cp[1])
@@ -220,17 +225,18 @@ def _to_design_graph(
             for k in range(count):
                 dev_id = f"{room_id}_{device}_{k}"
                 px, py = _wall_point(device, poly, cx, cy, offset=22, n_device=k)
+                _is_ceiling = ("light" in device or "smoke" in device
+                               or "co2" in device or "motion" in device)
                 dev_entry = {
                     "id":       dev_id,
                     "kind":     device,
                     "roomRef":  room_id,
-                    "mount":    "ceiling" if "light" in device else "wall",
-                    "heightMm": 0 if "light" in device else 300,
+                    "mount":    "ceiling" if _is_ceiling else "wall",
+                    "heightMm": 0 if _is_ceiling else 300,
                     "label":    device.replace("_", " ").title(),
                     "reason":   "NN-3 prediction",
                 }
                 if px is not None:
-                    # Clamp внутри bbox комнаты
                     px, py = _clamp_to_bbox(px, py, poly, margin=12)
                     dev_entry["xPx"] = px
                     dev_entry["yPx"] = py
@@ -255,8 +261,6 @@ def _to_design_graph(
     }
 
 
-# ─── публичный интерфейс ─────────────────────────────────────────────────────
-
 _infer_instance: Optional[PlacementInfer] = None
 
 def get_infer(model_dir: str = "models/nn3") -> Optional[PlacementInfer]:
@@ -278,7 +282,6 @@ def run_placement(
     Главная функция. Принимает PlanGraph и PreferencesGraph dict.
     Возвращает DesignGraph dict.
     """
-    # Конвертируем PlanGraph → nodes/edges для GNN
     rooms = plan_graph.get("rooms", [])
     nodes = []
     for room in rooms:
@@ -298,7 +301,6 @@ def run_placement(
             "has_entrance": False,
         })
 
-    # Рёбра из topology
     edges = []
     topology = plan_graph.get("topology") or {}
     for adj in topology.get("roomAdjacency", []):
@@ -309,12 +311,10 @@ def run_placement(
         if from_idx is not None and to_idx is not None:
             edges.append({"from": from_idx, "to": to_idx})
 
-    # Если нет рёбер — строим цепочку
     if not edges and len(nodes) > 1:
         for i in range(len(nodes) - 1):
             edges.append({"from": i, "to": i + 1})
 
-    # Пожелания
     prefs: Dict[str, Any] = {}
     if prefs_graph:
         for room_pref in prefs_graph.get("rooms", []):
@@ -325,7 +325,6 @@ def run_placement(
     if infer:
         placement = infer.predict(nodes, edges, prefs)
     else:
-        # Эвристика fallback
         from app.nn3.dataset_gen import BASE_RULES, _lights_from_area
         import random
         placement = {}

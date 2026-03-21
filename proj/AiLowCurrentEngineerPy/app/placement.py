@@ -1,419 +1,439 @@
 """
-app/placement.py
+app/placement.py — нормативное размещение устройств.
 
-Движок размещения слаботочных устройств.
-
-Поддерживаемые типы устройств (из rules.json):
-  - TV_SOCKET       — розетка ТВ (настенная, h=300мм)
-  - INTERNET_SOCKET — розетка интернет RJ-45 (настенная, h=300мм)
-  - SMOKE_DETECTOR  — датчик дыма (потолочный, ГОСТ Р 53325-2012)
-  - CO2_DETECTOR    — датчик CO2/воздуха (настенный, h=1500мм)
-  - CEILING_LIGHT   — основное освещение (потолочный центр)
-  - NIGHT_LIGHT     — ночник/бра (настенный, h=1400мм)
-
-Входные данные:
-  DB["rooms"][project_id]     — list[dict] комнаты из structure_postprocess
-  DB["structure"][project_id] — проёмы (двери/окна) если есть
-
-Выходные данные:
-  DB["devices"][project_id]   — list[PlacedDevice]
-  JSON + PNG через export_*
+Содержит:
+- _point_in_polygon      — ray casting
+- _build_lighting_zones  — сетка зон SVT внутри полигона (импорт из export_overlay_png)
+- _svt_grid_positions    — позиции SVT по зонам
+- _apply_hard_rules      — постпроцессинг: ГОСТ, ПУЭ, СП 484
+- _wall_positions_rzt    — распределение RZT по периметру с учётом дверей
 """
+
 from __future__ import annotations
-
 import math
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+import logging
+from typing import Dict, List, Optional, Tuple, Any
 
-from shapely.geometry import LineString, MultiPolygon, Point, Polygon
+logger = logging.getLogger("planner")
 
-from app.geometry import DB, along_wall_points, coerce_polygon, room_walls
-from app.rules import get_rules
+import re as import_re
 
-
-# ─────────────────────────── типы ────────────────────────────────
-
-@dataclass
-class PlacedDevice:
-    device_type: str          # TV_SOCKET, SMOKE_DETECTOR, …
-    room_id:     str          # room_000, room_001, …
-    room_type:   str          # living_room, bedroom, …
-    x:           float        # пиксели (image coords)
-    y:           float
-    mount:       str          # "wall" | "ceiling"
-    height_mm:   int          # высота монтажа от пола
-    label:       str          # человекочитаемое название
-    symbol:      str          # короткий символ для чертежа
+def _point_in_polygon(px: float, py: float, poly: list) -> bool:
+    """Ray casting — точка внутри полигона."""
+    n = len(poly)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = float(poly[i][0]), float(poly[i][1])
+        xj, yj = float(poly[j][0]), float(poly[j][1])
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
 
 
-# ─────────────────────────── утилиты ─────────────────────────────
-
-def _room_id(idx: int) -> str:
-    return f"room_{idx:03d}"
-
-
-def _room_size_hint(poly: Polygon) -> float:
-    return max(1.0, math.sqrt(abs(poly.area)))
-
-
-def _rooms_as_polygons(project_id: str) -> List[Tuple[int, dict, Polygon]]:
+def _svt_grid_positions(poly: list, area_m2: float, room_type: str = "living_room") -> list:
     """
-    Возвращает [(idx, raw_room_dict, Polygon), ...].
-    Поддерживает как dict из structure_postprocess (с полем 'contour'),
-    так и Polygon напрямую.
+    Возвращает список (px, py) центров зон освещения.
+    Использует те же зоны что и export_zones_preview — единый алгоритм.
     """
-    rooms_raw = DB.get("rooms", {}).get(project_id, [])
-    out = []
-    for idx, r in enumerate(rooms_raw):
-        if isinstance(r, Polygon):
-            out.append((idx, {}, r))
-            continue
-        if isinstance(r, dict):
-            # Пробуем polygon из контура postprocess
-            poly = None
-            pts = r.get("polygon") or r.get("polygonPx") or r.get("points")
-            if pts and isinstance(pts, list) and len(pts) >= 3:
-                try:
-                    poly = Polygon([(float(p[0]), float(p[1])) for p in pts])
-                    if not poly.is_valid:
-                        poly = poly.buffer(0)
-                except Exception:
-                    poly = None
-            if poly is None or poly.is_empty or poly.area < 1:
-                poly = coerce_polygon(r)
-            if poly is not None and poly.area > 1:
-                out.append((idx, r, poly))
-    return out
-
-
-def _openings_for_room(project_id: str, room_id: str) -> List[Dict[str, Any]]:
-    struct = DB.get("structure", {}).get(project_id)
-    if not struct:
+    if not poly or len(poly) < 3:
         return []
-    openings = struct.get("openings") or []
-    return [o for o in openings if room_id in (o.get("roomRefs") or [])]
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    w, h = x1 - x0, y1 - y0
 
-
-def _opening_seg(o: Dict[str, Any]) -> Optional[LineString]:
-    seg = o.get("segmentPx") or o.get("segment")
-    if not seg or not isinstance(seg, list) or len(seg) != 2:
-        return None
-    try:
-        (x1, y1), (x2, y2) = seg
-        return LineString([(float(x1), float(y1)), (float(x2), float(y2))])
-    except Exception:
-        return None
-
-
-def _offset_inside(room: Polygon, base: Point, seg: LineString) -> Point:
-    """Сдвигает точку вглубь комнаты от стены-сегмента."""
-    x1, y1 = seg.coords[0]
-    x2, y2 = seg.coords[-1]
-    dx, dy = x2 - x1, y2 - y1
-    L = math.hypot(dx, dy) or 1.0
-    nx, ny = -dy / L, dx / L
-    off = max(0.02 * _room_size_hint(room), 20.0)  # минимум 20px
-    p1 = Point(base.x + nx * off, base.y + ny * off)
-    p2 = Point(base.x - nx * off, base.y - ny * off)
-    if room.contains(p1):
-        return p1
-    if room.contains(p2):
-        return p2
-    return base
-
-
-def _ceiling_grid_points(poly: Polygon, step_px: float) -> List[Point]:
-    """Сетка точек внутри полигона для потолочных устройств."""
-    minx, miny, maxx, maxy = poly.bounds
-    pts = []
-    x = minx + step_px / 2
-    while x < maxx:
-        y = miny + step_px / 2
-        while y < maxy:
-            p = Point(x, y)
-            if poly.contains(p):
-                pts.append(p)
-            y += step_px
-        x += step_px
-    return pts
-
-
-def _best_wall_point(poly: Polygon, opening_segs: List[LineString],
-                     min_from_opening_px: float = 50.0) -> Optional[Point]:
-    """
-    Находит лучшую точку вдоль стен комнаты:
-    как можно дальше от проёмов и углов.
-    """
-    best_pt = None
-    best_score = -1.0
-    for wall in room_walls(poly):
-        L = float(wall.length)
-        if L < 80:
-            continue
-        for t in [0.25, 0.5, 0.75]:
-            p = wall.interpolate(t, normalized=True)
-            if not poly.contains(p):
-                continue
-            # минимальное расстояние до проёмов
-            min_d = min((seg.distance(p) for seg in opening_segs), default=999.0)
-            if min_d < min_from_opening_px:
-                continue
-            score = min_d
-            if score > best_score:
-                best_score = score
-                best_pt = p
-    return best_pt
-
-
-# ─────────────────────── генерация устройств ─────────────────────
-
-def _place_wall_device(
-    device_type: str,
-    rule: dict,
-    room_idx: int,
-    room_dict: dict,
-    poly: Polygon,
-    opening_segs: List[LineString],
-    count: int,
-) -> List[PlacedDevice]:
-    """Размещает настенное устройство вдоль стен комнаты."""
-    results = []
-    room_id   = _room_id(room_idx)
-    room_type = room_dict.get("room_type", "unknown")
-    mount     = rule.get("mount", "wall")
-    h_mm      = int(rule.get("height_mm", 300))
-    label     = rule.get("label", device_type)
-    symbol    = rule.get("symbol", "?")
-    min_op    = float(rule.get("min_from_door_mm", 150)) * 1.0  # в px (масштаб ~1px=14мм → /14)
-    # Переводим мм → px (эталон 14мм/px)
-    mm_per_px = 14.0
-    min_op_px = min_op / mm_per_px
-    min_corner_px = float(rule.get("min_from_corner_mm", 150)) / mm_per_px
-
-    placed = 0
-    used_pts: List[Point] = []
-
-    for wall in room_walls(poly):
-        if placed >= count:
-            break
-        L = float(wall.length)
-        if L < min_corner_px * 2:
-            continue
-        step = max(L / (count - placed + 1), 80.0)
-        t = min_corner_px
-        while t < L - min_corner_px and placed < count:
-            p = wall.interpolate(t)
-            # проверяем отступы от проёмов
-            min_d_op = min((s.distance(p) for s in opening_segs), default=999.0)
-            if min_d_op < min_op_px:
-                t += step
-                continue
-            # проверяем что не слишком близко к уже размещённым
-            min_d_used = min((p.distance(u) for u in used_pts), default=999.0)
-            if used_pts and min_d_used < 60.0:
-                t += step
-                continue
-            if poly.contains(p) or poly.boundary.distance(p) < 5:
-                results.append(PlacedDevice(
-                    device_type=device_type,
-                    room_id=room_id,
-                    room_type=room_type,
-                    x=float(p.x), y=float(p.y),
-                    mount=mount, height_mm=h_mm,
-                    label=label, symbol=symbol,
-                ))
-                used_pts.append(p)
-                placed += 1
-            t += step
-
-    # Если не удалось разместить все — fallback на centroid
-    while placed < count:
-        c = poly.centroid
-        results.append(PlacedDevice(
-            device_type=device_type,
-            room_id=room_id,
-            room_type=room_type,
-            x=float(c.x), y=float(c.y),
-            mount=mount, height_mm=h_mm,
-            label=label, symbol=symbol,
-        ))
-        placed += 1
-
-    return results
-
-
-def _place_ceiling_device(
-    device_type: str,
-    rule: dict,
-    room_idx: int,
-    room_dict: dict,
-    poly: Polygon,
-    count: int,
-) -> List[PlacedDevice]:
-    """Размещает потолочное устройство (датчик дыма, светильник)."""
-    results = []
-    room_id   = _room_id(room_idx)
-    room_type = room_dict.get("room_type", "unknown")
-    label     = rule.get("label", device_type)
-    symbol    = rule.get("symbol", "?")
-    min_wall_px = float(rule.get("min_from_wall_mm", 500)) / 14.0
-
-    if count == 1:
-        # Один датчик — в центр
-        c = poly.centroid
-        if not poly.contains(c):
-            c = poly.representative_point()
-        results.append(PlacedDevice(
-            device_type=device_type,
-            room_id=room_id, room_type=room_type,
-            x=float(c.x), y=float(c.y),
-            mount="ceiling", height_mm=0,
-            label=label, symbol=symbol,
-        ))
+    if room_type in ("bathroom", "toilet", "balcony"):
+        needed = 1
+    elif room_type == "corridor":
+        needed = max(1, min(4, round(area_m2 / 8.0)))
+    elif room_type == "kitchen":
+        needed = max(1, min(4, round(area_m2 / 10.0)))
     else:
-        # Несколько — равномерная сетка
-        area_px2 = poly.area
-        step = math.sqrt(area_px2 / count) * 0.9
-        pts = _ceiling_grid_points(poly, step)
-        # Сортируем по расстоянию от центра
-        c = poly.centroid
-        pts.sort(key=lambda p: p.distance(c))
-        placed = 0
-        used: List[Point] = []
-        min_sep = float(rule.get("min_from_other_detector_mm", 3000)) / 14.0
-        for p in pts:
-            if placed >= count:
+        needed = max(1, min(8, round(area_m2 / 16.0)))
+
+    aspect = w / max(1.0, h)
+    if needed == 1:
+        cols, rows = 1, 1
+    elif needed == 2:
+        cols, rows = (2, 1) if aspect >= 1.0 else (1, 2)
+    elif needed <= 4:
+        cols, rows = 2, 2
+    elif needed <= 6:
+        cols, rows = (3, 2) if aspect >= 1.0 else (2, 3)
+    else:
+        cols, rows = (3, 3) if needed <= 9 else (4, 3)
+
+    try:
+        from app.export_overlay_png import _build_lighting_zones
+        zones = _build_lighting_zones(poly, area_m2, room_type)
+        positions = [z["center"] for z in zones]
+        if positions:
+            return positions
+    except Exception:
+        pass
+
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    return [(int(sum(xs)/len(xs)), int(sum(ys)/len(ys)))]
+
+
+def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: list = None) -> dict:
+    """
+    Постпроцессинг после NN-3: применяем жёсткие правила которые нельзя нарушать.
+
+    Правила:
+    - internet_sockets: ОДИН на всю квартиру (corridor или living_room)
+    - smoke_detector: НЕ ставим на кухне и в санузлах, максимум 1 на комнату
+    - co2_detector: ТОЛЬКО кухня (и гостиная по желанию)
+    - night_lights: ТОЛЬКО спальня и коридор
+    - tv_sockets: НЕ ставим в corridor/bathroom/toilet/kitchen
+    """
+    forced_devices = forced_devices or {}
+
+    NO_SMOKE   = {"kitchen", "bathroom", "toilet", "balcony"}
+    NO_CO2     = {"bedroom", "bathroom", "toilet", "corridor", "balcony"}
+    NO_NIGHT   = {"living_room", "kitchen", "bathroom", "toilet"}
+    NO_TV      = {"corridor", "bathroom", "toilet"}
+    NO_SOCKET  = {"bathroom", "toilet", "balcony"}
+    ONLY_LIGHT = {"bathroom", "toilet", "balcony"}
+    DISABLED_DEVICES = {"tv_sockets", "night_lights"}
+
+    devices      = design_graph.get("devices", [])
+    room_designs = design_graph.get("roomDesigns", [])
+
+    room_areas = {}
+    for r in (rooms or []):
+        if isinstance(r, dict):
+            _rid = r.get("id") or r.get("roomId") or r.get("room_id") or ""
+            if isinstance(_rid, int):
+                _rid = f"room_{_rid:03d}"
+            _area = r.get("areaM2") or r.get("area_m2") or 999
+            if _rid:
+                room_areas[_rid] = float(_area)
+    for rd in room_designs:
+        rid = rd["roomId"]
+        if rid not in room_areas:
+            room_areas[rid] = rd.get("areaM2") or rd.get("area_m2") or 999
+
+    room_type_map = {}
+    for rd in room_designs:
+        rid   = rd["roomId"]
+        rtype = rd.get("roomType", "bedroom")
+        area  = room_areas.get(rid, 999)
+        if rtype == "kitchen" and area < 10:
+            rtype = "balcony"
+            logger.debug("Hard rules: %s reclassified kitchen→balcony (area=%.1f m²)", rid, area)
+        room_type_map[rid] = rtype
+
+    internet_room = None
+    for priority in ["corridor", "living_room"]:
+        for rd in room_designs:
+            if rd.get("roomType") == priority:
+                internet_room = rd["roomId"]
                 break
-            if min_wall_px > 0 and poly.boundary.distance(p) < min_wall_px:
+        if internet_room:
+            break
+    if not internet_room and room_designs:
+        internet_room = room_designs[0]["roomId"]
+
+    filtered_devices = []
+    internet_placed  = False
+
+    for d in devices:
+        kind    = d.get("kind", "")
+        if kind in DISABLED_DEVICES:
+            continue
+        room_id = d.get("roomRef", "") or d.get("room_id", "")
+        rtype   = room_type_map.get(room_id, "bedroom")
+
+        if rtype in ONLY_LIGHT and kind != "ceiling_lights":
+            continue
+
+        if rtype == "balcony" and kind == "ceiling_lights":
+            already = sum(1 for x in filtered_devices
+                          if x.get("kind") == "ceiling_lights"
+                          and (x.get("roomRef") == room_id or x.get("room_id") == room_id))
+            if already >= 1:
                 continue
-            if used and min((p.distance(u) for u in used)) < min_sep:
+
+        if kind == "smoke_detector" and rtype in NO_SMOKE:
+            continue
+        if kind == "co2_detector" and rtype in NO_CO2:
+            continue
+        if kind == "night_lights" and rtype in NO_NIGHT:
+            continue
+        if kind == "power_socket" and rtype in NO_SOCKET:
+            continue
+        if kind == "tv_sockets" and rtype in NO_TV:
+            continue
+
+        # LAN — строго одна на квартиру (любой, включая forced)
+        if kind == "internet_sockets":
+            if internet_placed:
                 continue
-            results.append(PlacedDevice(
-                device_type=device_type,
-                room_id=room_id, room_type=room_type,
-                x=float(p.x), y=float(p.y),
-                mount="ceiling", height_mm=0,
-                label=label, symbol=symbol,
-            ))
-            used.append(p)
-            placed += 1
-        # fallback
-        while placed < count:
-            rp = poly.representative_point()
-            results.append(PlacedDevice(
-                device_type=device_type,
-                room_id=room_id, room_type=room_type,
-                x=float(rp.x), y=float(rp.y),
-                mount="ceiling", height_mm=0,
-                label=label, symbol=symbol,
-            ))
-            placed += 1
+            internet_placed = True
 
-    return results
+        # DYM — максимум 1 на комнату (СП 484.1311500.2020 п.6.2)
+        if kind == "smoke_detector":
+            already_dym = sum(
+                1 for x in filtered_devices
+                if x.get("kind") == "smoke_detector"
+                and (x.get("roomRef") == room_id or x.get("room_id") == room_id)
+            )
+            if already_dym >= 1:
+                continue
 
+        filtered_devices.append(d)
 
-def _compute_count(device_rule: dict, room_type: str, area_m2: float) -> int:
-    """Вычисляет количество устройств для комнаты по правилам."""
-    room_rules = device_rule.get("rooms", {})
-    if room_type not in room_rules:
-        # Используем default_per_m2 если есть
-        per_m2 = device_rule.get("default_per_m2")
-        if per_m2 and area_m2 > 0:
-            return max(1, math.ceil(area_m2 / per_m2))
-        return 0
+    existing_ids = {d["id"] for d in filtered_devices}
+    from app.nn3.infer import _wall_point as _wp
+    _room_geo = {}
+    for r in (rooms or []):
+        if not isinstance(r, dict):
+            continue
+        _rid = r.get("id") or r.get("roomId") or r.get("room_id") or ""
+        if isinstance(_rid, int):
+            _rid = f"room_{_rid:03d}"
+        _poly = r.get("polygonPx") or []
+        _cp   = r.get("centroidPx") or []
+        if _poly:
+            if _cp and len(_cp) >= 2:
+                _cx, _cy = float(_cp[0]), float(_cp[1])
+            else:
+                _xs = [p[0] for p in _poly]; _ys = [p[1] for p in _poly]
+                _cx, _cy = sum(_xs)/len(_xs), sum(_ys)/len(_ys)
+            _room_geo[_rid] = (_poly, _cx, _cy)
 
-    rr = room_rules[room_type]
-    if rr.get("count") is not None:
-        return int(rr["count"])
-    if rr.get("per_m2") and area_m2 > 0:
-        cnt = math.ceil(area_m2 / rr["per_m2"])
-        cnt = max(rr.get("min", 1), cnt)
-        if "max" in rr:
-            cnt = min(rr["max"], cnt)
-        return cnt
-    return 0
-
-
-# ─────────────────────── главная функция ─────────────────────────
-
-def generate_placements(project_id: str) -> List[PlacedDevice]:
-    """
-    Основная функция движка размещения.
-    Размещает все устройства по всем комнатам согласно rules.json.
-
-    Возвращает список PlacedDevice и сохраняет в DB["devices"][project_id].
-    """
-    rules = get_rules()
-    device_rules: Dict[str, dict] = rules.get("devices", {})
-    mm_per_px = 14.0  # масштаб plan_001 эталон
-
-    room_tuples = _rooms_as_polygons(project_id)
-    all_devices: List[PlacedDevice] = []
-
-    for room_idx, room_dict, poly in room_tuples:
-        room_id   = _room_id(room_idx)
-        room_type = room_dict.get("room_type", "unknown")
-        area_m2   = float(room_dict.get("area_m2", poly.area / (1000 / mm_per_px) ** 2))
-
-        # Проёмы для этой комнаты
-        opening_segs = [
-            s for o in _openings_for_room(project_id, room_id)
-            if (s := _opening_seg(o)) is not None
-        ]
-
-        for device_type, drule in device_rules.items():
-            count = _compute_count(drule, room_type, area_m2)
+    for room_id, devs in forced_devices.items():
+        rtype = room_type_map.get(room_id, "bedroom")
+        for device, count in devs.items():
             if count <= 0:
                 continue
+            if device == "smoke_detector" and rtype in NO_SMOKE:
+                continue
+            if device == "co2_detector" and rtype in NO_CO2:
+                continue
+            # LAN — один на квартиру, forced тоже не исключение
+            if device == "internet_sockets":
+                if internet_placed:
+                    continue
+                internet_placed = True
+            filtered_devices = [d for d in filtered_devices
+                                 if not (d.get("roomRef") == room_id and d.get("kind") == device)]
+            for k in range(int(count)):
+                dev_id = f"{room_id}_{device}_{k}_forced"
+                if dev_id not in existing_ids:
+                    dev_entry = {
+                        "id":       dev_id,
+                        "kind":     device,
+                        "roomRef":  room_id,
+                        "room_id":  room_id,
+                        "mount":    "wall",
+                        "heightMm": 300,
+                        "label":    device.replace("_", " ").title(),
+                        "reason":   "user request",
+                    }
+                    if room_id in _room_geo:
+                        _poly, _cx, _cy = _room_geo[room_id]
+                        _px, _py = _wp(device, _poly, _cx, _cy, offset=22, n_device=k)
+                        if _px is not None:
+                            if _poly:
+                                _xs = [p[0] for p in _poly]; _ys = [p[1] for p in _poly]
+                                _x0, _x1 = min(_xs)+12, max(_xs)-12
+                                _y0, _y1 = min(_ys)+12, max(_ys)-12
+                                _px = int(max(_x0, min(_x1, _px)))
+                                _py = int(max(_y0, min(_y1, _py)))
+                            dev_entry["xPx"] = _px
+                            dev_entry["yPx"] = _py
+                    filtered_devices.append(dev_entry)
 
-            mount = drule.get("mount", "wall")
+    if not internet_placed and internet_room:
+        filtered_devices.append({
+            "id":       f"{internet_room}_internet_sockets_0",
+            "kind":     "internet_sockets",
+            "roomRef":  internet_room,
+            "room_id":  internet_room,
+            "mount":    "wall",
+            "heightMm": 300,
+            "label":    "Internet Sockets",
+            "reason":   "rule: one LAN per apartment",
+        })
 
-            if mount == "ceiling":
-                devices = _place_ceiling_device(
-                    device_type, drule, room_idx, room_dict, poly, count
-                )
-            else:
-                devices = _place_wall_device(
-                    device_type, drule, room_idx, room_dict, poly,
-                    opening_segs, count
-                )
+    # ── Нормативная коррекция количества SVT по СП 52.13330 ─────────────────
+    room_area_map = {}
+    for r in (rooms or []):
+        if not isinstance(r, dict):
+            continue
+        _rid = r.get("id") or r.get("roomId") or r.get("room_id") or ""
+        if isinstance(_rid, int):
+            _rid = f"room_{_rid:03d}"
+        _area = float(r.get("areaM2") or r.get("area_m2") or 0)
+        if _rid:
+            room_area_map[_rid] = _area
 
-            all_devices.extend(devices)
+    import math as _math
+    for room_id, rtype in room_type_map.items():
+        if rtype in ("bathroom", "toilet", "balcony"):
+            continue
+        area = room_area_map.get(room_id, 0)
+        if area <= 0:
+            continue
 
-    DB.setdefault("devices", {})[project_id] = all_devices
-    return all_devices
+        _room_poly_norm = []
+        for _r in (rooms or []):
+            if not isinstance(_r, dict):
+                continue
+            _rid_raw  = _r.get("id") or _r.get("roomId") or _r.get("room_id") or ""
+            _rid_norm = f"room_{_rid_raw:03d}" if isinstance(_rid_raw, int) else str(_rid_raw)
+            if _rid_norm == room_id or _rid_raw == room_id:
+                _room_poly_norm = _r.get("polygonPx") or []
+                break
 
+        svt_positions = _svt_grid_positions(_room_poly_norm, area, rtype)
+        needed_svt    = len(svt_positions)
 
-def placements_to_json(devices: List[PlacedDevice]) -> List[Dict[str, Any]]:
-    """Сериализует PlacedDevice в список dict для JSON-ответа."""
-    return [
-        {
-            "device_type": d.device_type,
-            "room_id":     d.room_id,
-            "room_type":   d.room_type,
-            "x":           round(d.x, 1),
-            "y":           round(d.y, 1),
-            "mount":       d.mount,
-            "height_mm":   d.height_mm,
-            "label":       d.label,
-            "symbol":      d.symbol,
-        }
-        for d in devices
-    ]
+        if _room_poly_norm and needed_svt > 0:
+            filtered_devices = [
+                d for d in filtered_devices
+                if not (d.get("kind") == "ceiling_lights"
+                        and (d.get("roomRef") == room_id or d.get("room_id") == room_id))
+            ]
+            for k, (px_svt, py_svt) in enumerate(svt_positions):
+                dev_id = f"{room_id}_ceiling_lights_zone_{k}"
+                filtered_devices.append({
+                    "id":       dev_id,
+                    "kind":     "ceiling_lights",
+                    "roomRef":  room_id,
+                    "mount":    "ceiling",
+                    "heightMm": 0,
+                    "label":    "Ceiling Lights",
+                    "reason":   f"zone: {needed_svt} SVT for {area:.0f}m²",
+                    "xPx":      px_svt,
+                    "yPx":      py_svt,
+                })
 
+    # ── Коррекция позиций DYM/CO2 — потолок, центр комнаты (СП 484) ──────────
+    for d in filtered_devices:
+        kind = d.get("kind", "")
+        if kind not in ("smoke_detector", "co2_detector"):
+            continue
+        room_id      = d.get("roomRef") or d.get("room_id") or ""
+        d["mount"]    = "ceiling"
+        d["heightMm"] = 0
+        _poly_dym = []
+        for _r in (rooms or []):
+            if not isinstance(_r, dict):
+                continue
+            _rid_raw  = _r.get("id") or _r.get("roomId") or _r.get("room_id") or ""
+            _rid_norm = f"room_{_rid_raw:03d}" if isinstance(_rid_raw, int) else str(_rid_raw)
+            if _rid_norm == room_id or _rid_raw == room_id:
+                _poly_dym = _r.get("polygonPx") or []
+                break
+        if not _poly_dym:
+            continue
+        _xs_d = [p[0] for p in _poly_dym]
+        _ys_d = [p[1] for p in _poly_dym]
+        _n_d  = len(_poly_dym)
+        _area_d = _acx_d = _acy_d = 0.0
+        for _j in range(_n_d):
+            _jj    = (_j + 1) % _n_d
+            _cross = _xs_d[_j] * _ys_d[_jj] - _xs_d[_jj] * _ys_d[_j]
+            _area_d += _cross
+            _acx_d  += (_xs_d[_j] + _xs_d[_jj]) * _cross
+            _acy_d  += (_ys_d[_j] + _ys_d[_jj]) * _cross
+        _area_d /= 2.0
+        if abs(_area_d) > 1e-6:
+            _cx_d = _acx_d / (6 * _area_d)
+            _cy_d = _acy_d / (6 * _area_d)
+        else:
+            _cx_d = sum(_xs_d) / _n_d
+            _cy_d = sum(_ys_d) / _n_d
+        if not _point_in_polygon(_cx_d, _cy_d, _poly_dym):
+            _cx_d = (min(_xs_d) + max(_xs_d)) / 2
+            _cy_d = (min(_ys_d) + max(_ys_d)) / 2
+            if not _point_in_polygon(_cx_d, _cy_d, _poly_dym):
+                try:
+                    from app.export_overlay_png import _nearest_interior_point as _nip
+                    _cx_d, _cy_d = _nip(_cx_d, _cy_d, _poly_dym, step=4)
+                except Exception:
+                    pass
+        d["xPx"] = int(_cx_d)
+        d["yPx"] = int(_cy_d)
 
-# ──────── Обратная совместимость со старым API ────────────────────
+    # ── Нормативная коррекция количества RZT по ПУЭ ──────────────────────────
+    from app.nn3.infer import _wall_point as _wp_norm2
+    for room_id, rtype in room_type_map.items():
+        if rtype in ("bathroom", "toilet", "corridor", "balcony"):
+            continue
+        area = room_area_map.get(room_id, 0)
+        if area <= 0:
+            continue
 
-Candidate = Tuple[str, str, Point]
+        _room_poly_rzt = []
+        for _r in (rooms or []):
+            if not isinstance(_r, dict):
+                continue
+            _rid_raw  = _r.get("id") or _r.get("roomId") or _r.get("room_id") or ""
+            _rid_norm = f"room_{_rid_raw:03d}" if isinstance(_rid_raw, int) else str(_rid_raw)
+            if _rid_norm == room_id or _rid_raw == room_id:
+                _room_poly_rzt = _r.get("polygonPx") or []
+                break
 
+        needed_rzt = max(1, min(6, round(area / 12.0)))
 
-def generate_candidates(project_id: str) -> List[Candidate]:
-    """Устаревший интерфейс — оставлен для совместимости."""
-    devices = generate_placements(project_id)
-    return [(d.device_type, d.room_id, Point(d.x, d.y)) for d in devices]
+        current_rzt = sum(
+            1 for d in filtered_devices
+            if d.get("kind") == "power_socket"
+            and (d.get("roomRef") == room_id or d.get("room_id") == room_id)
+        )
 
+        if current_rzt < needed_rzt:
+            existing_rzt_count = current_rzt
+            _cx_n = sum(p[0] for p in _room_poly_rzt) / len(_room_poly_rzt) if _room_poly_rzt else 0.0
+            _cy_n = sum(p[1] for p in _room_poly_rzt) / len(_room_poly_rzt) if _room_poly_rzt else 0.0
+            for k in range(needed_rzt - current_rzt):
+                dev_id = f"{room_id}_power_socket_auto_{k}"
+                n_idx  = existing_rzt_count + k
+                _px2, _py2 = _wp_norm2("power_socket", _room_poly_rzt,
+                                        _cx_n, _cy_n, offset=22, n_device=n_idx)
+                entry = {
+                    "id":       dev_id,
+                    "kind":     "power_socket",
+                    "roomRef":  room_id,
+                    "mount":    "wall",
+                    "heightMm": 300,
+                    "label":    "Power Socket",
+                    "reason":   f"norm: {needed_rzt} RZT for {area:.0f}m²",
+                }
+                if _px2 is not None:
+                    entry["xPx"] = _px2
+                    entry["yPx"] = _py2
+                filtered_devices.append(entry)
 
-def select_devices(project_id: str, candidates: List[Candidate]):
-    """Устаревший интерфейс — оставлен для совместимости."""
-    DB.setdefault("candidates", {})[project_id] = candidates
-    return candidates
+    # Пересчитываем deviceIds в roomDesigns
+    dev_ids_by_room: dict = {}
+    for d in filtered_devices:
+        rid = d.get("roomRef") or d.get("room_id", "")
+        dev_ids_by_room.setdefault(rid, []).append(d["id"])
+
+    new_room_designs = []
+    for rd in room_designs:
+        rid            = rd["roomId"]
+        corrected_type = room_type_map.get(rid, rd.get("roomType", "bedroom"))
+        new_room_designs.append({
+            **rd,
+            "roomType":  corrected_type,
+            "deviceIds": dev_ids_by_room.get(rid, []),
+        })
+
+    design_graph = {
+        **design_graph,
+        "devices":      filtered_devices,
+        "roomDesigns":  new_room_designs,
+        "totalDevices": len(filtered_devices),
+        "explain":      design_graph.get("explain", []) + ["Постпроцессинг: жёсткие правила применены"],
+    }
+    return design_graph

@@ -392,6 +392,30 @@ def _point_in_polygon(px: float, py: float, poly: list) -> bool:
     return inside
 
 
+def _nearest_interior_point(cx: float, cy: float, poly: list, step: int = 4) -> tuple:
+    """
+    Если точка (cx, cy) вне полигона — возвращает ближайшую внутреннюю точку.
+    Поиск по спирали вокруг исходной точки с шагом step px.
+    """
+    if _point_in_polygon(cx, cy, poly):
+        return int(cx), int(cy)
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    bx0, bx1 = min(xs), max(xs)
+    by0, by1 = min(ys), max(ys)
+    best_dist = float("inf")
+    best_pt = (int(cx), int(cy))
+    # Перебираем кандидатов внутри bbox с шагом step
+    for gx in range(int(bx0) + step, int(bx1), step):
+        for gy in range(int(by0) + step, int(by1), step):
+            if _point_in_polygon(gx, gy, poly):
+                dist = (gx - cx) ** 2 + (gy - cy) ** 2
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pt = (gx, gy)
+    return best_pt
+
+
 def _build_lighting_zones(poly: list, area_m2: float, room_type: str) -> list:
     """
     Строит сетку зон освещения внутри полигона комнаты.
@@ -440,6 +464,14 @@ def _build_lighting_zones(poly: list, area_m2: float, room_type: str) -> list:
                     "rect":   (int(zx0), int(zy0), int(zx0+zw), int(zy0+zh)),
                     "center": (int(cx), int(cy)),
                 })
+            else:
+                # Fallback для L-образных и нестандартных комнат:
+                # сдвигаем центр к ближайшей внутренней точке
+                fx, fy = _nearest_interior_point(cx, cy, poly, step=4)
+                zones.append({
+                    "rect":   (int(zx0), int(zy0), int(zx0+zw), int(zy0+zh)),
+                    "center": (fx, fy),
+                })
     return zones
 
 
@@ -472,27 +504,47 @@ def export_zones_preview(
         poly  = r.get("polygonPx") or []
         area  = float(r.get("areaM2") or r.get("area_m2") or 0)
         rtype = r.get("roomType") or r.get("room_type") or "bedroom"
-        if rtype in ("bathroom", "toilet", "balcony") or len(poly) < 3:
+        if rtype in ("bathroom", "toilet", "balcony") or len(poly) < 3 or area < 3:
             continue
 
         color  = palette[ri % len(palette)]
         dark   = tuple(max(0, c - 80) for c in color)
         zones  = _build_lighting_zones(poly, area, rtype)
 
-        # Сначала заливаем полигон комнаты
+        # 1. Заливаем полигон комнаты
         pts = np.array([[int(p[0]), int(p[1])] for p in poly], dtype=np.int32)
         cv2.fillPoly(overlay, [pts], color)
-        cv2.polylines(overlay, [pts], isClosed=True, color=dark, thickness=2)
 
-        # Рисуем сетку зон внутри полигона
+        # 2. Рисуем линии сетки ТОЛЬКО внутри полигона через маску
+        h_img2, w_img2 = overlay.shape[:2]
+        mask = np.zeros((h_img2, w_img2), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts], 255)
+
+        grid_layer = overlay.copy()
         for z in zones:
             zx0, zy0, zx1, zy1 = z["rect"]
             cx,  cy             = z["center"]
-            # Граница зоны (линии сетки)
-            cv2.rectangle(overlay, (zx0, zy0), (zx1, zy1), dark, 1)
-            # Точка SVT в центре зоны
-            cv2.circle(overlay, (cx, cy), 8, (0, 140, 140), -1)
-            cv2.circle(overlay, (cx, cy), 12, (0, 100, 100), 2)
+            cv2.rectangle(grid_layer, (zx0, zy0), (zx1, zy1), dark, 1)
+
+        # Применяем маску — линии только внутри полигона
+        overlay = np.where(mask[:,:,np.newaxis] > 0, grid_layer, overlay)
+
+        # 3. Точки SVT
+        for z in zones:
+            cx, cy = z["center"]
+            cv2.circle(overlay, (cx, cy), 10, (0, 130, 130), -1)
+            cv2.circle(overlay, (cx, cy), 14, (0, 90, 90), 2)
+
+        # 4. Контур комнаты
+        cv2.polylines(overlay, [pts], isClosed=True, color=dark, thickness=2)
+
+        # 5. Подпись
+        xs2 = [p[0] for p in poly]; ys2 = [p[1] for p in poly]
+        label_x = int((min(xs2)+max(xs2))/2) - 40
+        label_y = int(min(ys2)) + 25
+        label   = f"{area:.0f}m2 / {len(zones)}SVT"
+        cv2.putText(overlay, label, (label_x, label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, dark, 1, cv2.LINE_AA)
 
     cv2.addWeighted(overlay, 0.45, img, 0.55, 0, img)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)

@@ -149,7 +149,7 @@ def _assign_internet_socket(nodes: List[Dict]) -> Dict[str, int]:
 
 
 AREA_RANGES: Dict[str, Tuple[float, float]] = {
-    "living_room": (15.0, 50.0),
+    "living_room": (15.0, 150.0),  # реальные квартиры до 150m²
     "bedroom":     (9.0,  25.0),
     "kitchen":     (6.0,  15.0),
     "bathroom":    (3.0,  8.0),

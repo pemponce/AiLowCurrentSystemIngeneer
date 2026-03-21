@@ -13,7 +13,7 @@ from app.geometry_png import ingest_png
 from app.export_preview_png import export_preview_png, export_preview_canvas_png
 from app.lighting import design_lighting, LightingRequest, LightingResponse
 from app.geometry import DB
-from app.placement import generate_candidates, select_devices
+# placement.py — рефакторинг в процессе
 from app.routing import route_all
 from app.export_dxf import export_dxf
 from app.export_pdf import export_pdf
@@ -146,6 +146,21 @@ os.makedirs(LOCAL_EXPORT_DIR, exist_ok=True)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "debug").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("planner")
+
+# SQLite персистентная БД (дополняет in-memory DB для новых проектов)
+try:
+    from app.db import (
+        init_db, save_project, get_project,
+        save_rooms, get_rooms, save_design, get_design,
+        save_room_map, get_room_map, save_export, list_projects
+    )
+
+    init_db()
+    _SQLITE_OK = True
+    logger.info("SQLite DB ready")
+except Exception as _dbe:
+    _SQLITE_OK = False
+    logger.warning("SQLite unavailable: %s — using in-memory only", _dbe)
 
 
 def _artifact_ttl_seconds() -> int:
@@ -545,6 +560,45 @@ def _make_numbered_plan(image_path: str, rooms: list, project_id: str) -> tuple:
     return out_path, uri, room_map
 
 
+class UploadPlanRequest(BaseModel):
+    projectId: str = "plan001"
+    imageBase64: str  # PNG в base64
+    srcKey: Optional[str] = None
+
+
+@app.post("/upload", tags=["ingest"])
+async def upload_plan(req: UploadPlanRequest):
+    """
+    Загружает PNG план (base64) в MinIO и запускает ingest.
+    Использование:
+      import base64
+      data = base64.b64encode(open("plan.png","rb").read()).decode()
+      POST /upload  {"projectId":"plan001","imageBase64": data}
+    """
+    import base64, tempfile
+    try:
+        img_bytes = base64.b64decode(req.imageBase64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 image data")
+
+    key = req.srcKey or f"raw_plans/{req.projectId}_input.png"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+        tmp.write(img_bytes)
+        tmp_path = tmp.name
+
+    try:
+        upload_file(RAW_BUCKET, tmp_path, key)
+        logger.info("Uploaded plan to MinIO: %s/%s", RAW_BUCKET, key)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"MinIO upload failed: {e}")
+    finally:
+        os.unlink(tmp_path)
+
+    ingest_req = APIIngestRequest(projectId=req.projectId, srcKey=key)
+    result = await ingest(ingest_req)
+    return {"uploaded": key, "ingest": result}
+
+
 @app.post("/ingest")
 async def ingest(req: APIIngestRequest):
     DB.setdefault("rooms", {}).setdefault(req.project_id, [])
@@ -586,6 +640,14 @@ async def ingest(req: APIIngestRequest):
             _, numbered_url, room_map = _make_numbered_plan(local_path, nn1_rooms, req.project_id)
             DB.setdefault("room_map", {})[req.project_id] = room_map
             logger.info("Ingest room_map: %s", {k: v for k, v in room_map.items()})
+            # Сохраняем в SQLite
+            if _SQLITE_OK:
+                try:
+                    save_project(req.project_id, req.srcKey or "", local_path or "")
+                    save_rooms(req.project_id, nn1_rooms)
+                    save_room_map(req.project_id, room_map)
+                except Exception as _se:
+                    logger.debug("SQLite save failed: %s", _se)
             logger.info("Ingest: NN-1 нашла %d комнат, numbered plan создан", len(nn1_rooms))
 
     # Генерируем preview зон освещения
@@ -651,6 +713,12 @@ async def export(req: APIExportRequest):
 
         # ── 1. Комнаты: объединяем геометрию из DB["rooms"] с типами из DesignGraph ──
         legacy_rooms = DB.get("rooms", {}).get(req.project_id, []) or []
+        # Fallback из SQLite после рестарта
+        if not legacy_rooms and _SQLITE_OK:
+            legacy_rooms = get_rooms(req.project_id)
+            if legacy_rooms:
+                DB.setdefault("rooms", {})[req.project_id] = legacy_rooms
+                logger.info("Rooms restored from SQLite for %s", req.project_id)
         design_graph = DB.get("design", {}).get(req.project_id)
 
         # Строим map room_id → roomType из DesignGraph.roomDesigns
@@ -679,8 +747,8 @@ async def export(req: APIExportRequest):
                 return abs(area) / 2 * 0.000196
             return float(r.get("areaPx", 0)) * 0.000196
 
-        MIN_AREA_M2 = 3.0
-        MAX_AREA_M2 = 200.0
+        MIN_AREA_M2 = 4.5
+        MAX_AREA_M2 = 300.0
         ROOM_TYPES_CYCLE = [
             "living_room", "bedroom", "bedroom", "kitchen",
             "bathroom", "corridor", "toilet",
@@ -834,6 +902,14 @@ class DesignRequest(BaseModel):
     project_id: str = Field(validation_alias=AliasChoices("projectId", "project_id"))
     preferences_text: Optional[str] = Field(default=None,
                                             validation_alias=AliasChoices("preferencesText", "preferences_text"))
+
+
+@app.get("/projects", tags=["debug"])
+async def list_all_projects():
+    """Список всех проектов из SQLite."""
+    if _SQLITE_OK:
+        return {"projects": list_projects()}
+    return {"projects": list(DB.get("rooms", {}).keys())}
 
 
 @app.get("/debug/db/{project_id}", tags=["debug"])
@@ -1114,9 +1190,16 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
         room_id = d.get("roomRef", "") or d.get("room_id", "")
         rtype = room_type_map.get(room_id, "bedroom")
 
-        # Санузел/туалет — только ceiling_lights
+        # Санузел/туалет/балкон — только ceiling_lights
         if rtype in ONLY_LIGHT and kind != "ceiling_lights":
             continue
+        # Балкон — максимум 1 светильник
+        if rtype == "balcony" and kind == "ceiling_lights":
+            already = sum(1 for d in filtered_devices
+                          if d.get("kind") == "ceiling_lights"
+                          and (d.get("roomRef") == room_id or d.get("room_id") == room_id))
+            if already >= 1:
+                continue
 
         # Датчик дыма — не на кухне и не в санузлах
         if kind == "smoke_detector" and rtype in NO_SMOKE:
@@ -1255,9 +1338,9 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
         for _r in (rooms or []):
             if not isinstance(_r, dict):
                 continue
-            _rid_raw = _r.get("id") or _r.get("room_id") or ""
+            _rid_raw = _r.get("id") or _r.get("roomId") or _r.get("room_id") or ""
             _rid_norm = f"room_{_rid_raw:03d}" if isinstance(_rid_raw, int) else str(_rid_raw)
-            if _rid_norm == room_id:
+            if _rid_norm == room_id or _rid_raw == room_id:
                 _room_poly_norm = _r.get("polygonPx") or []
                 break
 
@@ -1287,7 +1370,56 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
                     "yPx": py_svt,
                 })
 
+    # ── Коррекция позиций DYM/CO2 — потолок, центр комнаты (СП 484) ──────────
+    for d in filtered_devices:
+        kind = d.get("kind", "")
+        if kind not in ("smoke_detector", "co2_detector"):
+            continue
+        room_id = d.get("roomRef") or d.get("room_id") or ""
+        d["mount"] = "ceiling"
+        d["heightMm"] = 0
+        _poly_dym = []
+        for _r in (rooms or []):
+            if not isinstance(_r, dict):
+                continue
+            _rid_raw = _r.get("id") or _r.get("roomId") or _r.get("room_id") or ""
+            _rid_norm = f"room_{_rid_raw:03d}" if isinstance(_rid_raw, int) else str(_rid_raw)
+            if _rid_norm == room_id or _rid_raw == room_id:
+                _poly_dym = _r.get("polygonPx") or []
+                break
+        if not _poly_dym:
+            continue
+        _xs_d = [p[0] for p in _poly_dym]
+        _ys_d = [p[1] for p in _poly_dym]
+        _n_d = len(_poly_dym)
+        _area_d = _acx_d = _acy_d = 0.0
+        for _j in range(_n_d):
+            _jj = (_j + 1) % _n_d
+            _cross = _xs_d[_j] * _ys_d[_jj] - _xs_d[_jj] * _ys_d[_j]
+            _area_d += _cross
+            _acx_d += (_xs_d[_j] + _xs_d[_jj]) * _cross
+            _acy_d += (_ys_d[_j] + _ys_d[_jj]) * _cross
+        _area_d /= 2.0
+        if abs(_area_d) > 1e-6:
+            _cx_d = _acx_d / (6 * _area_d)
+            _cy_d = _acy_d / (6 * _area_d)
+        else:
+            _cx_d = sum(_xs_d) / _n_d
+            _cy_d = sum(_ys_d) / _n_d
+        if not _point_in_polygon(_cx_d, _cy_d, _poly_dym):
+            _cx_d = (min(_xs_d) + max(_xs_d)) / 2
+            _cy_d = (min(_ys_d) + max(_ys_d)) / 2
+            if not _point_in_polygon(_cx_d, _cy_d, _poly_dym):
+                try:
+                    from app.export_overlay_png import _nearest_interior_point as _nip
+                    _cx_d, _cy_d = _nip(_cx_d, _cy_d, _poly_dym, step=4)
+                except Exception:
+                    pass
+        d["xPx"] = int(_cx_d)
+        d["yPx"] = int(_cy_d)
+
     # ── Нормативная коррекция количества RZT по ПУЭ ──────────────────────────
+    from app.nn3.infer import _wall_point as _wp_norm2
     for room_id, rtype in room_type_map.items():
         if rtype in ("bathroom", "toilet", "corridor", "balcony"):
             continue
@@ -1295,7 +1427,17 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
         if area <= 0:
             continue
 
-        # ПУЭ: 1 розетка на 6м², но реально не более 6 на комнату
+        # ВАЖНО: получаем polygonPx именно для ТЕКУЩЕЙ комнаты
+        _room_poly_rzt = []
+        for _r in (rooms or []):
+            if not isinstance(_r, dict):
+                continue
+            _rid_raw = _r.get("id") or _r.get("roomId") or _r.get("room_id") or ""
+            _rid_norm = f"room_{_rid_raw:03d}" if isinstance(_rid_raw, int) else str(_rid_raw)
+            if _rid_norm == room_id or _rid_raw == room_id:
+                _room_poly_rzt = _r.get("polygonPx") or []
+                break
+
         needed_rzt = max(1, min(6, round(area / 12.0)))
 
         current_rzt = sum(
@@ -1306,14 +1448,12 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
 
         if current_rzt < needed_rzt:
             existing_rzt_count = current_rzt
-            from app.nn3.infer import _wall_point as _wp_norm2
-            # Центроид комнаты для wall placement
-            _cx_n = sum(p[0] for p in _room_poly_norm) / len(_room_poly_norm) if _room_poly_norm else 0.0
-            _cy_n = sum(p[1] for p in _room_poly_norm) / len(_room_poly_norm) if _room_poly_norm else 0.0
+            _cx_n = sum(p[0] for p in _room_poly_rzt) / len(_room_poly_rzt) if _room_poly_rzt else 0.0
+            _cy_n = sum(p[1] for p in _room_poly_rzt) / len(_room_poly_rzt) if _room_poly_rzt else 0.0
             for k in range(needed_rzt - current_rzt):
                 dev_id = f"{room_id}_power_socket_auto_{k}"
                 n_idx = existing_rzt_count + k
-                _px2, _py2 = _wp_norm2("power_socket", _room_poly_norm,
+                _px2, _py2 = _wp_norm2("power_socket", _room_poly_rzt,
                                        _cx_n, _cy_n, offset=22, n_device=n_idx)
                 entry = {
                     "id": dev_id,
@@ -1329,6 +1469,113 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
                     entry["yPx"] = _py2
                 filtered_devices.append(entry)
 
+    # ── Выключатели SWI — у каждого дверного проёма (СП 256) ──────────────────
+    # Если NN-1 не вернула doors — вычисляем проёмы через смежность полигонов
+    try:
+        from app.geometry import detect_doorways as _detect_doorways
+        _all_doorways = _detect_doorways(rooms or [], tolerance=18.0)
+    except Exception as _dw_err:
+        logger.warning("SWI: detect_doorways failed: %s", _dw_err)
+        _all_doorways = []
+
+    # Строим карту room_id → список проёмов
+    _doorway_map: dict = {}
+    for _dw in _all_doorways:
+        for _side in ("room_a", "room_b"):
+            _rid = _dw[_side]
+            _doorway_map.setdefault(_rid, []).append({"cx": _dw["cx"], "cy": _dw["cy"]})
+
+    for room_id, rtype in room_type_map.items():
+        if rtype in ("bathroom", "toilet"):
+            continue
+        # Находим дверные проёмы комнаты из геометрии
+        _room_data = None
+        for _r2 in (rooms or []):
+            _rid2 = _r2.get("id") or _r2.get("room_id") or ""
+            _rid2n = f"room_{_rid2:03d}" if isinstance(_rid2, int) else str(_rid2)
+            if _rid2n == room_id or _rid2 == room_id:
+                _room_data = _r2
+                break
+        if not _room_data:
+            continue
+        poly_swi = _room_data.get("polygonPx") or []
+        if not poly_swi:
+            continue
+
+        # Приоритет: doors из NN-1 → detect_doorways → fallback на центроид входной стены
+        doors = _room_data.get("doors") or []
+        if doors:
+            door_points = [
+                {"cx": float(d.get("x") or d.get("cx") or 0),
+                 "cy": float(d.get("y") or d.get("cy") or 0)}
+                for d in doors
+                if (d.get("x") or d.get("cx"))
+            ]
+        else:
+            door_points = _doorway_map.get(room_id, [])
+
+        # Финальный fallback: кратчайшее ребро полигона (вероятный проём)
+        if not door_points and len(poly_swi) >= 3:
+            _walls_swi = []
+            _n_swi = len(poly_swi)
+            for _wi in range(_n_swi):
+                _x1, _y1 = float(poly_swi[_wi][0]), float(poly_swi[_wi][1])
+                _x2, _y2 = float(poly_swi[(_wi+1) % _n_swi][0]), float(poly_swi[(_wi+1) % _n_swi][1])
+                _wlen = (((_x2-_x1)**2 + (_y2-_y1)**2) ** 0.5)
+                if _wlen >= 15:
+                    _walls_swi.append({"cx": (_x1+_x2)/2, "cy": (_y1+_y2)/2, "len": _wlen})
+            if _walls_swi:
+                _shortest = min(_walls_swi, key=lambda w: w["len"])
+                door_points = [{"cx": _shortest["cx"], "cy": _shortest["cy"]}]
+
+        for di, door in enumerate(door_points):
+            dx = float(door.get("cx") or door.get("x") or 0)
+            dy = float(door.get("cy") or door.get("y") or 0)
+            if dx == 0 and dy == 0:
+                continue
+            # SWI ставим вплотную к стене рядом с проёмом (сдвиг вдоль стены)
+            best_wall_pt = None
+            best_dist = float("inf")
+            _n_swi2 = len(poly_swi)
+            for _wi2 in range(_n_swi2):
+                _x1s = float(poly_swi[_wi2][0])
+                _y1s = float(poly_swi[_wi2][1])
+                _x2s = float(poly_swi[(_wi2 + 1) % _n_swi2][0])
+                _y2s = float(poly_swi[(_wi2 + 1) % _n_swi2][1])
+                _wlen2 = ((_x2s - _x1s) ** 2 + (_y2s - _y1s) ** 2) ** 0.5
+                if _wlen2 < 15:
+                    continue
+                _tx = (_x2s - _x1s) / _wlen2
+                _ty = (_y2s - _y1s) / _wlen2
+                _proj = (_tx * (dx - _x1s) + _ty * (dy - _y1s))
+                _proj = max(0.1 * _wlen2, min(0.9 * _wlen2, _proj))
+                _px_w = _x1s + _tx * _proj
+                _py_w = _y1s + _ty * _proj
+                _d = (_px_w - dx) ** 2 + (_py_w - dy) ** 2
+                if _d < best_dist:
+                    best_dist = _d
+                    _side_offset = min(25.0, _wlen2 * 0.15)
+                    _proj2 = min(_proj + _side_offset, 0.9 * _wlen2)
+                    best_wall_pt = (
+                        int(_x1s + _tx * _proj2),
+                        int(_y1s + _ty * _proj2)
+                    )
+            if best_wall_pt:
+                swi_x, swi_y = best_wall_pt
+            else:
+                swi_x, swi_y = int(dx), int(dy)
+
+            filtered_devices.append({
+                "id": f"{room_id}_switch_{di}",
+                "kind": "switch",
+                "roomRef": room_id,
+                "mount": "wall",
+                "heightMm": 900,
+                "label": "Switch",
+                "reason": "rule: SWI at door" if doors else "rule: SWI at detected opening",
+                "xPx": swi_x,
+                "yPx": swi_y,
+            })
     # Пересчитываем deviceIds в roomDesigns
     dev_ids_by_room: dict = {}
     for d in filtered_devices:
@@ -1520,6 +1767,11 @@ async def design(req: DesignRequest):
 
     # Сохраняем в DB
     DB.setdefault("design", {})[project_id] = design_graph
+    if _SQLITE_OK:
+        try:
+            save_design(project_id, design_graph)
+        except Exception as _se:
+            logger.debug("SQLite design save: %s", _se)
     DB.setdefault("devices", {})[project_id] = design_graph.get("devices", [])
 
     logger.info(
