@@ -1,5 +1,4 @@
 version: "3.9"
-
 services:
   db:
     image: postgis/postgis:15-3.4
@@ -49,7 +48,7 @@ services:
       - JWT_TTL_MS
     ports: ["8080:8080"]
     depends_on: [db, minio, planner]
-  
+
   planner:
     build: ./AiLowCurrentEngineerPy
     env_file: .env
@@ -68,7 +67,8 @@ services:
       - ./samples/rules/rules_ru_gost_example.json:/app/rules.json:ro
       - planner_data:/data
       - ./samples:/samples:ro
-
+      # HOT RELOAD — изменения в app/ применяются без rebuild
+      - ./AiLowCurrentEngineerPy/app:/app/app
     ports: ["8000:8000"]
 
   minio-init:

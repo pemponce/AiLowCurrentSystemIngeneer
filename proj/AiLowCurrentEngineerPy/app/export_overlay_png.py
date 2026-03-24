@@ -437,7 +437,7 @@ def _build_lighting_zones(poly: list, area_m2: float, room_type: str) -> list:
     elif room_type == "kitchen":
         n = max(1, min(4, round(area_m2 / 10.0)))
     else:
-        n = max(1, min(8, round(area_m2 / 16.0)))
+        n = max(1, min(8, round(area_m2 / 30.0)))
 
     aspect = w / max(1.0, h)
     if n == 1:
@@ -569,7 +569,7 @@ def export_overlay_png(
         raise ValueError(f"Не могу прочитать: {src_image_path}")
 
     h, w = img.shape[:2]
-    icon_r = max(10, min(20, w // 80))  # радиус иконки — адаптивный
+    icon_r = max(4, min(10, w // 160))  # радиус иконки — адаптивный
 
     # Центроиды комнат
     room_centroids = _build_room_centroids(rooms)
