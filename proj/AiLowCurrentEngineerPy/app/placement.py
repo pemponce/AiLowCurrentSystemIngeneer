@@ -160,7 +160,7 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
         if rtype in ONLY_LIGHT and kind != "ceiling_lights":
             continue
         # Балкон — максимум 1 светильник
-        if rtype == "balcony" and kind == "ceiling_lights":
+        if rtype in ("balcony", "bathroom", "toilet") and kind == "ceiling_lights":
             already = sum(1 for d in filtered_devices
                           if d.get("kind") == "ceiling_lights"
                           and (d.get("roomRef") == room_id or d.get("room_id") == room_id))
@@ -542,6 +542,18 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
                 "xPx": swi_x,
                 "yPx": swi_y,
             })
+
+    dym_seen = set()
+    deduped = []
+    for d in filtered_devices:
+        if d.get("kind") == "smoke_detector":
+            rid = d.get("roomRef") or d.get("room_id", "")
+            if rid in dym_seen:
+                continue
+            dym_seen.add(rid)
+        deduped.append(d)
+    filtered_devices = deduped
+
     # Пересчитываем deviceIds в roomDesigns
     dev_ids_by_room: dict = {}
     for d in filtered_devices:

@@ -1,6 +1,7 @@
 # app/main.py
 
 from fastapi import FastAPI, HTTPException
+from app.api.design_compare import router as compare_router
 from pydantic import BaseModel, Field, ConfigDict, AliasChoices
 from typing import Optional, List, Literal, Dict, Tuple, Any
 import re as regex
@@ -132,6 +133,8 @@ app = FastAPI(title="Low-Current Planner")
 app.include_router(structure_router)
 app.include_router(artifacts_router)
 app.include_router(state_router)
+app.include_router(compare_router, tags=["Comparison"])
+
 
 LOCAL_RAW_DIR = os.getenv("LOCAL_DOWNLOAD_DIR", "/data")
 LOCAL_DL_DIR = os.getenv("LOCAL_DOWNLOAD_DIR_INFER", "/tmp/downloads")
@@ -1294,6 +1297,336 @@ async def design(req: DesignRequest):
 
     return design_graph
 
+
+@app.post("/design_nn3", tags=["design"])
+async def design_nn3(req: Dict[str, Any]):
+    """
+    ЧИСТЫЙ NN-3:
+    - без placement.py
+    - без _apply_hard_rules
+    - без override
+
+    Только:
+    NN-1 → NN-2 → NN-3 → результат
+    """
+
+    project_id = req.get("projectId")
+    prefs_text = req.get("preferencesText", "")
+
+    if not project_id:
+        raise HTTPException(400, "projectId required")
+
+    # ─────────────────────────────────────────────
+    # 1. PLAN GRAPH (как в /design)
+    # ─────────────────────────────────────────────
+    plan_graph = DB.get("plan_graph", {}).get(project_id)
+
+    if not plan_graph:
+        rooms = DB.get("rooms", {}).get(project_id)
+        if not rooms:
+            raise HTTPException(404, f"Plan not found: {project_id}")
+
+        # fallback как в /design
+        converted = []
+        for i, r in enumerate(rooms):
+            converted.append({
+                "id": r.get("id") or f"room_{i}",
+                "roomType": r.get("roomType") or r.get("room_type") or "living_room",
+                "areaM2": r.get("areaM2") or r.get("area") or 10.0,
+                "isExterior": r.get("isExterior", True),
+            })
+
+        plan_graph = {
+            "projectId": project_id,
+            "rooms": converted,
+            "openings": [],
+            "topology": {"roomAdjacency": []},
+        }
+
+    # ─────────────────────────────────────────────
+    # 2. NN-2 (preferences)
+    # ─────────────────────────────────────────────
+    prefs_graph = DB.get("preferences", {}).get(project_id)
+
+    if prefs_text:
+        from app.main import _parse_preferences
+        prefs_graph = _parse_preferences(prefs_text, project_id=project_id)
+        DB.setdefault("preferences", {})[project_id] = prefs_graph
+
+    # ─────────────────────────────────────────────
+    # 3. NN-3 (ГЛАВНОЕ)
+    # ─────────────────────────────────────────────
+    design_graph = nn3_run_placement(
+        plan_graph=plan_graph,
+        prefs_graph=prefs_graph,
+        project_id=project_id,
+    )
+
+    # КРИТИЧНО: Передаём rooms для проверки координат и санузлов
+    rooms_list = []
+    if "rooms" in DB and project_id in DB["rooms"]:
+        rooms_list = DB["rooms"][project_id]
+
+    design_graph = _validate_nn3_output(design_graph, rooms=rooms_list)
+
+    # ❌ НЕТ ЭТОГО:
+    # design_graph = _apply_hard_rules(...)
+    # placement.py не используется
+
+    # ─────────────────────────────────────────────
+    # 4. Сохраняем отдельно (ВАЖНО!)
+    # ─────────────────────────────────────────────
+    DB.setdefault("design_nn3", {})[project_id] = design_graph
+
+    # (опционально для compare через SQLite)
+    try:
+        from app.db import save_design
+        save_design(f"{project_id}_nn3", design_graph)
+    except Exception:
+        pass
+
+    return {
+        "project_id": project_id,
+        "mode": "NN-3 only (no postprocessing)",
+        "totalDevices": design_graph.get("totalDevices", 0),
+        "devices": design_graph.get("devices", []),
+    }
+
+
+def _validate_nn3_output(design_graph: dict, rooms: list = None) -> dict:
+    """
+    Улучшенная валидация NN-3 без замены устройств.
+
+    Что делает:
+    - Удаляет временно отключённые устройства (tv_sockets, night_lights)
+    - Дедупликация устройств по координатам
+    - Санузел: max 1 SVT (оставляем ближайший к центру)
+    - Координаты внутри bbox полигона
+    - Max 1 DYM на комнату
+
+    Что НЕ делает:
+    - НЕ заменяет SVT на zone-grid
+    - НЕ добавляет RZT по нормативу
+    - НЕ добавляет SWI у дверей
+    """
+    devices = design_graph.get("devices", [])
+    room_designs = design_graph.get("roomDesigns", [])
+
+    # Константы
+    DISABLED_DEVICES = {"tv_sockets", "night_lights"}  # Временно отключены
+    BATHROOM_TYPES = {"bathroom", "toilet", "balcony"}
+
+    # Карта типов комнат
+    room_type_map = {rd["roomId"]: rd.get("roomType", "bedroom") for rd in room_designs}
+
+    # Карта полигонов комнат (для проверки координат)
+    room_polygons = {}
+    if rooms:
+        for r in rooms:
+            if not isinstance(r, dict):
+                continue
+            _rid = r.get("id") or r.get("roomId") or r.get("room_id") or ""
+            if isinstance(_rid, int):
+                _rid = f"room_{_rid:03d}"
+            _poly = r.get("polygonPx") or []
+            if _poly and len(_poly) >= 3:
+                room_polygons[_rid] = _poly
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ШАГ 1: Удаляем временно отключённые устройства
+    # ══════════════════════════════════════════════════════════════════════════
+    filtered = []
+    removed_disabled = 0
+
+    for d in devices:
+        kind = d.get("kind", "")
+        if kind in DISABLED_DEVICES:
+            removed_disabled += 1
+            continue
+        filtered.append(d)
+
+    devices = filtered
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ШАГ 2: Дедупликация по ID
+    # ══════════════════════════════════════════════════════════════════════════
+    seen_ids = set()
+    deduped = []
+    removed_duplicate_ids = 0
+
+    for d in devices:
+        dev_id = d.get("id", "")
+        if dev_id in seen_ids:
+            removed_duplicate_ids += 1
+            continue
+        seen_ids.add(dev_id)
+        deduped.append(d)
+
+    devices = deduped
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ШАГ 3: Дедупликация по координатам (одинаковые позиции)
+    # ══════════════════════════════════════════════════════════════════════════
+    position_keys = set()
+    final_devices = []
+    removed_duplicate_positions = 0
+
+    for d in devices:
+        room_id = d.get("roomRef") or d.get("room_id", "")
+        kind = d.get("kind", "")
+        x = d.get("xPx", 0)
+        y = d.get("yPx", 0)
+
+        # Ключ: room + kind + координаты (округлённые до 5px)
+        # Это позволяет убрать устройства в одной точке
+        x_rounded = round(x / 5) * 5
+        y_rounded = round(y / 5) * 5
+        key = f"{room_id}_{kind}_{x_rounded}_{y_rounded}"
+
+        if key in position_keys:
+            removed_duplicate_positions += 1
+            continue
+
+        position_keys.add(key)
+        final_devices.append(d)
+
+    devices = final_devices
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ШАГ 4: Max 1 DYM на комнату
+    # ══════════════════════════════════════════════════════════════════════════
+    dym_seen = set()
+    deduped_dym = []
+    removed_dym = 0
+
+    for d in devices:
+        if d.get("kind") == "smoke_detector":
+            rid = d.get("roomRef") or d.get("room_id", "")
+            if rid in dym_seen:
+                removed_dym += 1
+                continue
+            dym_seen.add(rid)
+        deduped_dym.append(d)
+
+    devices = deduped_dym
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ШАГ 5: Санузел max 1 SVT
+    # ══════════════════════════════════════════════════════════════════════════
+    removed_bathroom_svt = 0
+
+    for room_id, rtype in room_type_map.items():
+        if rtype not in BATHROOM_TYPES:
+            continue
+
+        # Находим все SVT в этой комнате
+        svt_list = [d for d in devices
+                    if d.get("kind") == "ceiling_lights"
+                    and (d.get("roomRef") == room_id or d.get("room_id") == room_id)]
+
+        if len(svt_list) <= 1:
+            continue
+
+        # Вычисляем центр комнаты
+        cx, cy = 0, 0
+        if room_id in room_polygons:
+            poly = room_polygons[room_id]
+            xs = [p[0] for p in poly]
+            ys = [p[1] for p in poly]
+            cx = sum(xs) / len(xs)
+            cy = sum(ys) / len(ys)
+        else:
+            # Fallback: среднее по всем SVT
+            if svt_list:
+                cx = sum(s.get("xPx", 0) for s in svt_list) / len(svt_list)
+                cy = sum(s.get("yPx", 0) for s in svt_list) / len(svt_list)
+
+        # Сортируем по расстоянию до центра
+        def _dist(d):
+            dx = d.get("xPx", 0) - cx
+            dy = d.get("yPx", 0) - cy
+            return dx * dx + dy * dy
+
+        svt_sorted = sorted(svt_list, key=_dist)
+        keep = svt_sorted[0]  # ближайший к центру
+
+        # Удаляем остальные
+        devices = [d for d in devices
+                   if not (d.get("kind") == "ceiling_lights"
+                           and (d.get("roomRef") == room_id or d.get("room_id") == room_id)
+                           and d["id"] != keep["id"])]
+
+        removed_bathroom_svt += len(svt_list) - 1
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ШАГ 6: Проверка координат внутри bbox комнаты
+    # ══════════════════════════════════════════════════════════════════════════
+    corrected_positions = 0
+
+    for d in devices:
+        room_id = d.get("roomRef") or d.get("room_id", "")
+        if room_id not in room_polygons:
+            continue
+
+        poly = room_polygons[room_id]
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+
+        x = d.get("xPx", 0)
+        y = d.get("yPx", 0)
+
+        # Clamp внутри bbox с небольшим margin
+        margin = 10
+        x_clamped = max(x_min + margin, min(x_max - margin, x))
+        y_clamped = max(y_min + margin, min(y_max - margin, y))
+
+        if x != x_clamped or y != y_clamped:
+            d["xPx"] = int(x_clamped)
+            d["yPx"] = int(y_clamped)
+            corrected_positions += 1
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ШАГ 7: Пересчитываем deviceIds в roomDesigns
+    # ══════════════════════════════════════════════════════════════════════════
+    dev_ids_by_room = {}
+    for d in devices:
+        rid = d.get("roomRef") or d.get("room_id", "")
+        dev_ids_by_room.setdefault(rid, []).append(d["id"])
+
+    new_room_designs = []
+    for rd in room_designs:
+        rid = rd["roomId"]
+        new_room_designs.append({
+            **rd,
+            "deviceIds": dev_ids_by_room.get(rid, []),
+        })
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Логирование статистики
+    # ══════════════════════════════════════════════════════════════════════════
+    total_removed = (removed_disabled + removed_duplicate_ids +
+                     removed_duplicate_positions + removed_dym + removed_bathroom_svt)
+
+    logger.info(
+        "NN-3 validation: removed %d devices "
+        "(disabled: %d, dup_ids: %d, dup_pos: %d, dym: %d, bathroom_svt: %d), "
+        "corrected %d positions",
+        total_removed, removed_disabled, removed_duplicate_ids,
+        removed_duplicate_positions, removed_dym, removed_bathroom_svt,
+        corrected_positions
+    )
+
+    return {
+        **design_graph,
+        "devices": devices,
+        "roomDesigns": new_room_designs,
+        "totalDevices": len(devices),
+        "explain": design_graph.get("explain", []) + [
+            f"Валидация NN-3: удалено {total_removed} некорректных устройств"
+        ]
+    }
 
 @app.post("/infer")
 async def infer(req: APIInferRequest):
