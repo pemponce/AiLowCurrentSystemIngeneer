@@ -430,6 +430,30 @@ def _build_lighting_zones(poly: list, area_m2: float, room_type: str) -> list:
     by0, by1 = min(ys), max(ys)
     w, h = bx1 - bx0, by1 - by0
 
+    # Динамический margin: больше отступ для больших комнат
+    if area_m2 > 100:
+        margin = 120  # ← Увеличили для больших комнат
+    elif area_m2 > 50:
+        margin = 40
+    else:
+        margin = 30
+
+    # Применяем margin к bbox
+    bx0 += margin
+    bx1 -= margin
+    by0 += margin
+    by1 -= margin
+    w, h = bx1 - bx0, by1 - by0
+
+    # Проверка что margin не съел всю комнату
+    if w < 50 or h < 50:
+        # Fallback: минимальный margin
+        bx0 = min(xs) + 30
+        bx1 = max(xs) - 30
+        by0 = min(ys) + 30
+        by1 = max(ys) - 30
+        w, h = bx1 - bx0, by1 - by0
+
     if room_type in ("bathroom", "toilet"):
         n = 1
     elif room_type == "corridor":

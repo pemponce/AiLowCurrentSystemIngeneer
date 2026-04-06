@@ -974,6 +974,7 @@ def _parse_numbered_preferences(text: str, room_map: dict) -> dict:
         (r"пожарн", "smoke_detector"),
     ]
 
+
     def _parse_count(token: str) -> int:
         """Извлекает число из токена: '2', '2-4' → среднее=3, 'два'=2 и т.д."""
         WORDS = {"один": 1, "одна": 1, "одного": 1, "два": 2, "две": 2, "трёх": 3, "три": 3,
@@ -1034,6 +1035,17 @@ def _parse_numbered_preferences(text: str, room_map: dict) -> dict:
         room_id = room_map.get(num)
         if not room_id or not room_body:
             continue
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # ДОБАВЬ ЭТИ СТРОКИ (НОВОЕ)
+        # ═══════════════════════════════════════════════════════════════════════
+        # Проверка на "ничего", "пусто", "без устройств"
+        room_body_lower = room_body.lower()
+        if any(word in room_body_lower for word in ["ничего", "пусто", "без", "none", "empty", "skip"]):
+            # Добавляем маркер что эту комнату нужно пропустить
+            rooms_prefs[room_id] = {"_skip": True}
+            continue
+        # ═══════════════════════════════════════════════════════════════════════
 
         devs = _parse_room_segment(room_body)
         if devs:
@@ -1275,11 +1287,27 @@ async def design(req: DesignRequest):
         project_id=project_id,
     )
 
+    by_room_id = (prefs_graph or {}).get("_by_room_id", {})
+    skip_rooms = [rid for rid, devs in by_room_id.items() if isinstance(devs, dict) and devs.get("_skip")]
+
+    if skip_rooms:
+        logger.info("Skipping devices for rooms: %s", skip_rooms)
+        # Удаляем устройства из этих комнат
+        devices_before = design_graph.get("devices", [])
+        devices_after = [
+            d for d in devices_before
+            if (d.get("roomRef") or d.get("room_id", "")) not in skip_rooms
+        ]
+        design_graph["devices"] = devices_after
+        design_graph["totalDevices"] = len(devices_after)
+        logger.info("Removed %d devices from skip rooms", len(devices_before) - len(devices_after))
+
     # Применяем жёсткие правила + пожелания по номерам комнат
     by_room_id = (prefs_graph or {}).get("_by_room_id", {})
     # Передаём rooms из DB чтобы _apply_hard_rules знал площади комнат
     _rooms_for_rules = DB.get("rooms", {}).get(project_id, [])
-    design_graph = _apply_hard_rules(design_graph, forced_devices=by_room_id, rooms=_rooms_for_rules)
+    design_graph = _apply_hard_rules(design_graph, forced_devices=by_room_id, rooms=_rooms_for_rules,
+                                     skip_rooms=skip_rooms)
 
     # Сохраняем в DB
     DB.setdefault("design", {})[project_id] = design_graph

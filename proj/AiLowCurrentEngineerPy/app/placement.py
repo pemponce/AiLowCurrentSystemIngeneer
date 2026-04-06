@@ -81,7 +81,7 @@ def _svt_grid_positions(poly: list, area_m2: float, room_type: str = "living_roo
     return [(int(sum(xs)/len(xs)), int(sum(ys)/len(ys)))]
 
 
-def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: list = None) -> dict:
+def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: list = None, skip_rooms: list = None) -> dict:
     """
     Постпроцессинг после NN-3: применяем жёсткие правила которые нельзя нарушать.
 
@@ -93,6 +93,7 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
     - tv_sockets: НЕ ставим в corridor/bathroom/toilet/kitchen
     """
     forced_devices = forced_devices or {}
+    skip_rooms = skip_rooms or []
 
     NO_SMOKE = {"kitchen", "bathroom", "toilet", "balcony"}
     NO_CO2 = {"bedroom", "bathroom", "toilet", "corridor", "balcony"}
@@ -171,8 +172,8 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
         if kind == "smoke_detector" and rtype in NO_SMOKE:
             continue
 
-        # CO2 — только кухня
-        if kind == "co2_detector" and rtype in NO_CO2:
+        # CO2 — ОТКЛЮЧЕН ПОЛНОСТЬЮ (временно)
+        if kind == "co2_detector":
             continue
 
         # Ночник — только спальня и коридор
@@ -223,6 +224,8 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
             _room_geo[_rid] = (_poly, _cx, _cy)
 
     for room_id, devs in forced_devices.items():
+        if isinstance(devs, dict) and devs.get("_skip"):
+            continue
         rtype = room_type_map.get(room_id, "bedroom")
         for device, count in devs.items():
             if count <= 0:
@@ -293,6 +296,8 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
 
     import math as _math
     for room_id, rtype in room_type_map.items():
+        if room_id in skip_rooms:
+            continue
         if rtype in ("bathroom", "toilet", "balcony"):
             continue
         area = room_area_map.get(room_id, 0)
@@ -323,6 +328,20 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
             ]
             # Добавляем SVT с правильными координатами зон освещения
             for k, (px_svt, py_svt) in enumerate(svt_positions):
+                too_close_to_dym = False
+                for d in filtered_devices:
+                    if d.get("kind") == "smoke_detector" and d.get("roomRef") == room_id:
+                        dym_x = d.get("xPx", 0)
+                        dym_y = d.get("yPx", 0)
+                        dist = ((px_svt - dym_x) ** 2 + (py_svt - dym_y) ** 2) ** 0.5
+                        if dist < 100:  # Минимум 100px между SVT и DYM
+                            too_close_to_dym = True
+                            break
+
+                if too_close_to_dym:
+                    continue  # Пропускаем этот SVT
+
+                # Добавляем SVT
                 dev_id = f"{room_id}_ceiling_lights_zone_{k}"
                 filtered_devices.append({
                     "id": dev_id,
@@ -335,6 +354,26 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
                     "xPx": px_svt,
                     "yPx": py_svt,
                 })
+
+                # ═══════════════════════════════════════════════════════════════════════
+                # ВАЛИДАЦИЯ ПОЗИЦИЙ SVT (НОВОЕ - ДОБАВЬ ЭТИ СТРОКИ)
+                # ═══════════════════════════════════════════════════════════════════════
+                from app.svt_validator import apply_svt_validation_to_design_graph
+
+                # Создаём временный design_graph для валидации
+                design_graph_temp = {
+                    "devices": filtered_devices,
+                    "roomDesigns": room_designs,
+                    "totalDevices": len(filtered_devices),
+                    "explain": design_graph.get("explain", [])
+                }
+
+                # Применяем валидацию SVT
+                design_graph_temp = apply_svt_validation_to_design_graph(design_graph_temp, rooms or [])
+
+                # Обновляем filtered_devices валидированными устройствами
+                filtered_devices = design_graph_temp["devices"]
+                # ═══════════════════════════════════════════════════════════════════════
 
     # ── Коррекция позиций DYM/CO2 — потолок, центр комнаты (СП 484) ──────────
     for d in filtered_devices:
@@ -387,6 +426,8 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
     # ── Нормативная коррекция количества RZT по ПУЭ ──────────────────────────
     from app.nn3.infer import _wall_point as _wp_norm2
     for room_id, rtype in room_type_map.items():
+        if room_id in skip_rooms:
+            continue
         if rtype in ("bathroom", "toilet", "corridor", "balcony"):
             continue
         area = room_area_map.get(room_id, 0)
@@ -452,6 +493,8 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
             _doorway_map.setdefault(_rid, []).append({"cx": _dw["cx"], "cy": _dw["cy"]})
 
     for room_id, rtype in room_type_map.items():
+        if room_id in skip_rooms:
+            continue
         if rtype in ("bathroom", "toilet"):
             continue
         # Находим дверные проёмы комнаты из геометрии
