@@ -1,0 +1,26 @@
+{
+  "num_samples": 8000,
+  "train_size": 6430,
+  "val_size": 778,
+  "test_size": 792,
+  "max_rooms": 12,
+  "max_devices": 12,
+  "node_features": 17,
+  "devices": [
+    "ceiling_lights",
+    "power_socket",
+    "smoke_detector",
+    "co2_detector",
+    "internet_sockets",
+    "switch"
+  ],
+  "room_types": [
+    "living_room",
+    "bedroom",
+    "kitchen",
+    "bathroom",
+    "toilet",
+    "corridor",
+    "balcony"
+  ]
+}
