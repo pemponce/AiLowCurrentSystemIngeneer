@@ -29,7 +29,7 @@ class PlacementInfer:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         ckpt   = torch.load(os.path.join(model_dir, "nn3_best.pt"), map_location=device)
         model  = PlacementGNN().to(device)
-        model.load_state_dict(ckpt["model_state"])
+        model.load_state_dict(ckpt["model_state_dict"])
         model.eval()
         print(f"NN-3 загружена: val_acc={ckpt.get('val_acc', '?'):.3f}")
         return cls(model, device)

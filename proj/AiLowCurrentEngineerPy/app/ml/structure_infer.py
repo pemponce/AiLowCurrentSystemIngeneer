@@ -6,6 +6,7 @@ import os.path as osp
 from typing import Dict, Tuple, List, Any
 
 import cv2
+import uuid
 import numpy as np
 import torch
 from PIL import Image
@@ -13,15 +14,14 @@ from torchvision.transforms import functional as TF
 
 from app.ml.model_structure import build_structure_model
 
-
 DEFAULT_CLASS_NAMES = ["bg", "wall", "door", "window", "front_door"]
 
 PALETTE: Dict[int, Tuple[int, int, int]] = {
-    0: (0, 0, 0),         # bg
-    1: (0, 0, 255),       # wall - red
-    2: (0, 255, 255),     # door - yellow
-    3: (255, 255, 0),     # window - cyan
-    4: (255, 0, 255),     # front_door - magenta
+    0: (0, 0, 0),  # bg
+    1: (0, 0, 255),  # wall - red
+    2: (0, 255, 255),  # door - yellow
+    3: (255, 255, 0),  # window - cyan
+    4: (255, 0, 255),  # front_door - magenta
 }
 
 
@@ -140,7 +140,7 @@ def main() -> None:
 
     pred = infer_one(model, img_bgr, device)
 
-    pred_mask_path = osp.join(args.out, "pred_mask.png")
+    pred_mask_path = osp.join(args.out, f"{uuid.uuid4()}_pred_mask.png")
     pred_color_path = osp.join(args.out, "pred_color.png")
     overlay_path = osp.join(args.out, "overlay.png")
     preproc_path = osp.join(args.out, "input_preprocessed.png")
@@ -173,7 +173,8 @@ def main() -> None:
     print(f"Classes in prediction: {uniq} -> {used} (num_classes={num_classes})")
     print("Coverage:")
     for k, v in cov_items:
-        print(f"  {k:12s}: {v*100:.3f}%")
+        print(f"  {k:12s}: {v * 100:.3f}%")
+
 
 if __name__ == "__main__":
     main()

@@ -575,22 +575,23 @@ def export_zones_preview(
     cv2.imwrite(out_path, img)
 
 def export_overlay_png(
-    src_image_path: str,
+    base_image_path: str,
     rooms:   List[Dict],
     devices: List[Dict],
     routes:  List[Any],
-    out_path: str,
+    output_path: str,
+    project_id: str
 ) -> str:
     """
     Рисует устройства поверх оригинального плана.
     rooms  — список комнат с polygonPx (для центроидов)
     devices — список устройств с roomRef
     """
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    img = cv2.imread(src_image_path, cv2.IMREAD_COLOR)
+    img = cv2.imread(base_image_path, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError(f"Не могу прочитать: {src_image_path}")
+        raise ValueError(f"Не могу прочитать: {base_image_path}")
 
     h, w = img.shape[:2]
     icon_r = max(4, min(10, w // 160))  # радиус иконки — адаптивный
@@ -665,7 +666,7 @@ def export_overlay_png(
                     (lx + icon_r * 2 + 10, iy + 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (40, 40, 40), 1, cv2.LINE_AA)
 
-    ok = cv2.imwrite(out_path, img)
+    ok = cv2.imwrite(output_path, img)
     if not ok:
-        raise ValueError(f"Не могу записать: {out_path}")
-    return out_path
+        raise ValueError(f"Не могу записать: {output_path}")
+    return output_path
