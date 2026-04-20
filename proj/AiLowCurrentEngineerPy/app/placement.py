@@ -95,13 +95,17 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
     forced_devices = forced_devices or {}
     skip_rooms = skip_rooms or []
 
+    # ВАЖНО: Сначала берём devices, ПОТОМ логируем!
+    devices_in = design_graph.get("devices", [])
+    logger.info(f"POSTPROCESS START: {len(devices_in)} devices before rules")
+
     NO_SMOKE = {"kitchen", "bathroom", "toilet", "balcony"}
     NO_CO2 = {"bedroom", "bathroom", "toilet", "corridor", "balcony"}
     NO_NIGHT = {"living_room", "kitchen", "bathroom", "toilet"}
     NO_TV = {"corridor", "bathroom", "toilet"}
     NO_SOCKET = {"bathroom", "toilet", "balcony"}
-    ONLY_LIGHT = {"bathroom", "toilet", "balcony"}  # только свет, ничего другого
-    DISABLED_DEVICES = {"tv_sockets", "night_lights"}  # временно отключены
+    ONLY_LIGHT = {"bathroom", "toilet", "balcony"}
+    DISABLED_DEVICES = {"tv_sockets", "night_lights"}
 
     devices = design_graph.get("devices", [])
     room_designs = design_graph.get("roomDesigns", [])
@@ -149,7 +153,7 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
     filtered_devices = []
     internet_placed = False
 
-    for d in devices:
+    for d in devices_in:
         kind = d.get("kind", "")
         # Временно отключённые устройства
         if kind in DISABLED_DEVICES:
@@ -320,13 +324,31 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
         needed_svt = len(svt_positions)
 
         if _room_poly_norm and needed_svt > 0:
-            # Удаляем ВСЕ старые SVT этой комнаты — заменяем на zone grid
-            filtered_devices = [
+            # Проверяем сколько SVT уже есть в комнате
+            current_svt = [
                 d for d in filtered_devices
-                if not (d.get("kind") == "ceiling_lights"
-                        and (d.get("roomRef") == room_id or d.get("room_id") == room_id))
+                if d.get("kind") == "ceiling_lights"
+                   and (d.get("roomRef") == room_id or d.get("room_id") == room_id)
             ]
-            # Добавляем SVT с правильными координатами зон освещения
+
+            # Если SVT уже достаточно (от NN-3 или forced) — НЕ трогаем!
+            if len(current_svt) >= needed_svt:
+                logger.info(f"  Room {room_id}: keeping {len(current_svt)} SVT (enough)")
+                continue  # Переходим к следующей комнате
+
+            # Если SVT меньше нужного — удаляем старые и добавляем zone grid
+            logger.info(f"  Room {room_id}: replacing {len(current_svt)} SVT with {needed_svt} zone grid")
+
+            new_filtered_devices = []
+            for d in filtered_devices:
+                if d.get("kind") == "ceiling_lights":
+                    if d.get("roomRef") == room_id or d.get("room_id") == room_id:
+                        logger.debug(f"  REMOVING SVT from {room_id}: replaced by zone grid")
+                        continue
+                new_filtered_devices.append(d)
+
+            filtered_devices = new_filtered_devices
+
             for k, (px_svt, py_svt) in enumerate(svt_positions):
                 too_close_to_dym = False
                 for d in filtered_devices:
@@ -621,4 +643,10 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
         "totalDevices": len(filtered_devices),
         "explain": design_graph.get("explain", []) + ["Постпроцессинг: жёсткие правила применены"],
     }
+    logger.info(f"POSTPROCESS DONE: {len(filtered_devices)} devices after rules")
+
+    for dev in filtered_devices:
+        if dev.get("kind") == "ceiling_lights":
+            logger.debug(f"  SVT kept: room={dev.get('roomRef')}, reason={dev.get('reason')}")
+
     return design_graph

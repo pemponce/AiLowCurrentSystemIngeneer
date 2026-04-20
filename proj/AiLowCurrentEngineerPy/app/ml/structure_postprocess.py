@@ -27,7 +27,9 @@ import numpy as np
 from pathlib import Path
 from typing import Optional
 from skimage.morphology import skeletonize
+import logging
 
+logger = logging.getLogger("planner")
 # ─────────────────────────── константы ───────────────────────────
 CLASS_BG = 0
 CLASS_WALL = 1
@@ -206,12 +208,140 @@ def _merge_adjacent_rooms(labels, num, wall_mask, min_room_area):
     return merged_labels
 
 
+def _split_large_L_room(contour: np.ndarray, area_m2: float, min_part_m2: float = 40.0) -> list:
+    """
+    Разделяет очень большую L-образную комнату на части.
+
+    ПРОСТОЙ АЛГОРИТМ:
+    1. Проверяем площадь > 100m²
+    2. Вычисляем convex hull (выпуклую оболочку)
+    3. Находим самый глубокий дефект (вогнутость)
+    4. Если дефект > 50px → разрезаем там
+
+    Args:
+        contour: Контур комнаты
+        area_m2: Площадь комнаты в м²
+        min_part_m2: Минимальная площадь части (40m²)
+
+    Returns:
+        [contour] если не делим, [part1, part2] если разделили
+    """
+    PX_TO_M2 = 0.000196  # 1px² ≈ 0.000196m² для DPI=96
+
+    # Порог для разделения: > 100m²
+    if area_m2 < 100:
+        return [contour]
+
+    try:
+        # Вычисляем выпуклую оболочку
+        hull = cv2.convexHull(contour, returnPoints=False)
+
+        if hull is None or len(hull) < 3:
+            return [contour]
+
+        # Находим дефекты выпуклости
+        defects = cv2.convexityDefects(contour, hull)
+
+        if defects is None or len(defects) == 0:
+            return [contour]  # Нет вогнутостей - комната выпуклая
+
+        # Ищем самый глубокий дефект
+        max_depth = 0
+        deepest_defect = None
+
+        for defect in defects:
+            depth = defect[0][3] / 256.0  # Глубина в пикселях
+            if depth > max_depth:
+                max_depth = depth
+                deepest_defect = defect[0]
+
+        # Порог глубины: > 50px
+        if max_depth < 50:
+            logger.debug(f"L-room check: max_depth={max_depth:.1f}px < 50px -> NO SPLIT")
+            return [contour]
+
+        logger.info(f"L-room detected: area={area_m2:.0f}m², max_depth={max_depth:.1f}px -> TRYING SPLIT")
+
+        # Точки дефекта
+        start_idx = deepest_defect[0]
+        end_idx = deepest_defect[1]
+        far_idx = deepest_defect[2]
+
+        start_pt = tuple(contour[start_idx][0])
+        end_pt = tuple(contour[end_idx][0])
+        far_pt = tuple(contour[far_idx][0])
+
+        # Создаём маску и рисуем линию разреза
+        x, y, w, h = cv2.boundingRect(contour)
+        mask = np.zeros((h + 20, w + 20), dtype=np.uint8)
+
+        shifted_contour = contour.copy()
+        shifted_contour[:, :, 0] -= (x - 10)
+        shifted_contour[:, :, 1] -= (y - 10)
+
+        cv2.drawContours(mask, [shifted_contour], -1, 255, -1)
+
+        # Рисуем линию разреза через самую глубокую точку
+        # Упрощённо: линия от start до end через far
+        cut_line = np.zeros_like(mask)
+
+        # Сдвигаем координаты для локальной маски
+        s_pt = (start_pt[0] - x + 10, start_pt[1] - y + 10)
+        e_pt = (end_pt[0] - x + 10, end_pt[1] - y + 10)
+
+        cv2.line(cut_line, s_pt, e_pt, 255, 5)
+
+        # Разрезаем
+        cut_mask = cv2.bitwise_and(mask, cv2.bitwise_not(cut_line))
+
+        # Находим компоненты
+        num, labels_cut, stats_cut, _ = cv2.connectedComponentsWithStats(cut_mask, connectivity=8)
+
+        parts = []
+        for i in range(1, num):
+            part_area_px = stats_cut[i, cv2.CC_STAT_AREA]
+            part_area_m2 = part_area_px * PX_TO_M2
+
+            if part_area_m2 < min_part_m2:
+                logger.debug(f"  Part {i}: {part_area_m2:.1f}m² < {min_part_m2}m² -> SKIP")
+                continue
+
+            part_mask = (labels_cut == i).astype(np.uint8) * 255
+            part_contours, _ = cv2.findContours(part_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if part_contours:
+                # Возвращаем контур в исходные координаты
+                part_cnt = part_contours[0]
+                part_cnt[:, :, 0] += (x - 10)
+                part_cnt[:, :, 1] += (y - 10)
+
+                parts.append(part_cnt)
+                logger.debug(f"  Part {i}: {part_area_m2:.1f}m² -> ACCEPTED")
+
+        if len(parts) == 2:
+            logger.info(f"L-room SPLIT SUCCESS: {area_m2:.0f}m² → {len(parts)} parts")
+            return parts
+        else:
+            logger.info(f"L-room SPLIT FAILED: got {len(parts)} parts instead of 2")
+            return [contour]
+
+    except Exception as e:
+        logger.error(f"L-room split error: {e}")
+        return [contour]
+
+
 # ──────────────────────── извлечение комнат ──────────────────────
 
 def _extract_rooms(wall_mask, door_mask, win_mask=None, min_room_area=2000):
+    """
+    Извлекает комнаты с улучшенным фильтром улицы V3.
+    """
+    PX_TO_M2 = 0.000196
+
     h, w = wall_mask.shape
 
-    # Добавляем 2px рамку по краям, чтобы "запереть" комнаты внутри
+    logger.info(f"_extract_rooms START: image {w}x{h}, min_area={min_room_area}px")
+
     walled = wall_mask.copy()
     cv2.rectangle(walled, (0, 0), (w - 1, h - 1), 255, 2)
 
@@ -219,8 +349,6 @@ def _extract_rooms(wall_mask, door_mask, win_mask=None, min_room_area=2000):
     if win_mask is not None:
         combined = cv2.bitwise_or(combined, win_mask)
 
-    # Используем минимальную дилатацию, чтобы не сливать комнаты через двери,
-    # но позволить им быть "близко" друг к другу
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     dilated = cv2.dilate(combined, k, iterations=1)
     free_space = cv2.bitwise_not(dilated)
@@ -231,55 +359,132 @@ def _extract_rooms(wall_mask, door_mask, win_mask=None, min_room_area=2000):
 
     num, labels, stats, centroids = cv2.connectedComponentsWithStats(free_space, connectivity=8)
 
-    # Объединяем L-образные комнаты, разделенные виртуальными границами
+    logger.info(f"  Initial regions: {num - 1}")
+
     labels = _merge_adjacent_rooms(labels, num, wall_mask, min_room_area)
 
-    # Пересчитываем компоненты после объединения
-    num, labels, stats, centroids = cv2.connectedComponentsWithStats((labels > 0).astype(np.uint8) * 255,
-                                                                     connectivity=8)
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        (labels > 0).astype(np.uint8) * 255, connectivity=8
+    )
+
+    logger.info(f"  After merge: {num - 1} regions")
 
     bg_candidates = [labels[1, 1], labels[1, w - 2], labels[h - 2, 1], labels[h - 2, w - 2]]
     bg_id = max(set(bg_candidates), key=bg_candidates.count)
 
     rooms = []
+    filtered_bg = 0
+    filtered_area = 0
+    filtered_street = 0
+    split_count = 0
+
     for i in range(1, num):
         area = int(stats[i, cv2.CC_STAT_AREA])
-        if area < min_room_area or i == bg_id:
+        area_m2 = area * PX_TO_M2
+
+        # Фильтр минимальной площади: 1.5m² или min_room_area (что больше)
+        MIN_AREA_M2 = 1.5
+        min_area_px = max(min_room_area, int(MIN_AREA_M2 / PX_TO_M2))
+
+        if area < min_area_px:
+            filtered_area += 1
+            logger.debug(f"  Region {i}: {area_m2:.1f}m² < {MIN_AREA_M2}m² -> SKIP (too small)")
+            continue
+
+        if i == bg_id:
+            filtered_bg += 1
             continue
 
         room_bin = (labels == i).astype(np.uint8) * 255
 
-        # КРИТЕРИЙ УЛИЦЫ: Проверяем, есть ли у комнаты хотя бы одна стена рядом
-        # Расширяем комнату и смотрим пересечение со стенами
-        k_check = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-        expanded_room = cv2.dilate(room_bin, k_check)
-        if not np.any(cv2.bitwise_and(expanded_room, wall_mask)):
-            # Если стен рядом нет — это улица/пустота
-            continue
+        # ========== ФИЛЬТР УЛИЦЫ V3 ==========
+        is_street = False
 
-        cx, cy = float(centroids[i][0]), float(centroids[i][1])
-        x = int(stats[i, cv2.CC_STAT_LEFT])
-        y = int(stats[i, cv2.CC_STAT_TOP])
-        rw = int(stats[i, cv2.CC_STAT_WIDTH])
-        rh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        x_room = int(stats[i, cv2.CC_STAT_LEFT])
+        y_room = int(stats[i, cv2.CC_STAT_TOP])
+        rw_room = int(stats[i, cv2.CC_STAT_WIDTH])
+        rh_room = int(stats[i, cv2.CC_STAT_HEIGHT])
+
+        edge_threshold = 20
+        is_on_edge = (
+                x_room < edge_threshold or
+                y_room < edge_threshold or
+                (x_room + rw_room) > (w - edge_threshold) or
+                (y_room + rh_room) > (h - edge_threshold)
+        )
+
+        if is_on_edge:
+            k_check = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
+            expanded_room = cv2.dilate(room_bin, k_check)
+            wall_contact = cv2.bitwise_and(expanded_room, wall_mask)
+
+            wall_contact_area = np.sum(wall_contact > 0)
+            wall_contact_ratio = wall_contact_area / area if area > 0 else 0
+
+            door_inside = cv2.bitwise_and(room_bin, door_mask)
+            has_doors = np.sum(door_inside > 0) > 100
+
+            contours_check, _ = cv2.findContours(room_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours_check:
+                perimeter = cv2.arcLength(contours_check[0], True)
+                perimeter_ratio = perimeter / (2 * (w + h))
+
+                if (wall_contact_ratio < 0.10 or perimeter_ratio > 0.7) and not has_doors:
+                    is_street = True
+                    logger.info(
+                        f"  Region {i}: {area_m2:.1f}m² -> STREET "
+                        f"(wall={wall_contact_ratio:.2f}, perimeter={perimeter_ratio:.2f}, doors={has_doors})"
+                    )
+
+        if is_street:
+            filtered_street += 1
+            continue
+        # ========== КОНЕЦ ФИЛЬТРА УЛИЦЫ ==========
 
         contours, _ = cv2.findContours(room_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contour = contours[0] if contours else None
-        polygon = None
-        if contour is not None:
-            epsilon = 0.01 * cv2.arcLength(contour, True)
-            polygon = cv2.approxPolyDP(contour, epsilon, True)
 
-        rooms.append({
-            "id": i,
-            "centroid": (cx, cy),
-            "bbox": (x, y, rw, rh),
-            "area_px": area,
-            "contour": contour,
-            "polygon": polygon,
-        })
+        if contour is None:
+            continue
 
-    rooms.sort(key=lambda r: r["area_px"], reverse=True)
+        room_parts = _split_large_L_room(contour, area_m2, min_part_m2=40.0)
+
+        if len(room_parts) > 1:
+            split_count += 1
+
+        for part_contour in room_parts:
+            part_area_px = int(cv2.contourArea(part_contour))
+
+            if part_area_px < min_room_area:
+                continue
+
+            M = cv2.moments(part_contour)
+            if M["m00"] > 0:
+                cx = M["m10"] / M["m00"]
+                cy = M["m01"] / M["m00"]
+            else:
+                cx, cy = float(centroids[i][0]), float(centroids[i][1])
+
+            x, y, rw, rh = cv2.boundingRect(part_contour)
+
+            epsilon = 0.01 * cv2.arcLength(part_contour, True)
+            polygon = cv2.approxPolyDP(part_contour, epsilon, True)
+
+            rooms.append({
+                "id": len(rooms) + 1,
+                "centroid": (cx, cy),
+                "bbox": (x, y, rw, rh),
+                "area_px": part_area_px,
+                "contour": part_contour,
+                "polygon": polygon,
+            })
+
+    logger.info(
+        f"_extract_rooms DONE: {len(rooms)} rooms | "
+        f"filtered: bg={filtered_bg}, area={filtered_area}, street={filtered_street} | "
+        f"L-splits={split_count}"
+    )
+
     return rooms
 
 

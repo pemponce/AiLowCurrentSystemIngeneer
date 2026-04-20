@@ -16,6 +16,9 @@ import torch
 
 from app.nn3.model import PlacementGNN, PlanDataset, encode_node, MAX_DEVICE, MAX_ROOMS, N_NODE_FEATS
 from app.nn3.dataset_gen import DEVICES, ROOM_TYPES
+import logging
+
+logger = logging.getLogger("planner")
 
 
 class PlacementInfer:
@@ -250,6 +253,10 @@ def _to_design_graph(
             "violations": [],
         })
 
+        logger.info(f"_to_design_graph: created {len(devices_list)} devices")
+        svt_count = sum(1 for d in devices_list if d.get("kind") == "ceiling_lights")
+        logger.info(f"  SVT total: {svt_count}")
+
     return {
         "version":     "design-1.0",
         "projectId":   project_id,
@@ -339,6 +346,10 @@ def run_placement(
                     else:
                         result[device] = random.randint(mn, mx)
             placement[node["room_id"]] = result
+            logger.info(f"NN-3 placement result: {len(placement)} rooms")
+            for room_id, devices in placement.items():
+                if "ceiling_lights" in devices:
+                    logger.info(f"  NN-3: room {room_id} -> SVT={devices['ceiling_lights']}")
 
     return _to_design_graph(placement, nodes, project_id)
 

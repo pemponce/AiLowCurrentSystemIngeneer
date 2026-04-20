@@ -121,7 +121,17 @@ PNG план → NN-1 (сегментация) → NN-2 (пожелания) →
 
 #### POST /upload
 Загрузка PNG плана в MinIO
+```json
+$bytes = [System.IO.File]::ReadAllBytes("C:\Users\azhel\Desktop\PLOT\input.png")
+$b64 = [Convert]::ToBase64String($bytes)
 
+$body = @{
+    projectId = "test001"
+    imageBase64 = $b64
+} | ConvertTo-Json
+$b64 | Set-Clipboard
+
+```
 **Request:**
 ```json
 {
@@ -327,20 +337,28 @@ curl -X POST http://localhost:8000/upload `
 # 2. Сегментация
 curl -X POST http://localhost:8000/ingest `
   -H "Content-Type: application/json" `
-  -d '{"projectId":"plan009","srcKey":"raw_plans/plan009.png"}'
+  -d '{
+  "projectId": "plan201",
+  "srcKey": "raw_plans/plan201/3ec64d63-6b0e-4e8e-903a-c5f8cf5773d4.png"
+}'
 
 # 3. Размещение устройств
 curl -X POST http://localhost:8000/design `
   -H "Content-Type: application/json" `
   -d '{
-  "projectId": "plan009",
-  "preferencesText": "1: свет, розетки, дым; 2: свет, розетки; 3: свет, 2 розетки; 4: свет, 2 розетки"
+  "projectId": "plan201",
+  "preferencesText": "1: свет, розетки, дым; 2: свет, розетки; 3: свет, 2 розетки; 4: свет, 2 розетки;"
 }'
 
 # 4. Экспорт
 curl -X POST http://localhost:8000/export `
   -H "Content-Type: application/json" `
-  -d '{"projectId":"plan009","formats":["PNG"]}'
+  -d '{
+  "projectId": "plan201",
+  "formats": [
+    "PNG"
+  ]
+}'
 ```
 
 ### Сравнение методов

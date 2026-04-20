@@ -129,10 +129,12 @@ def parse_numbered_preferences(text: str, room_map: dict) -> dict:
         room_body_lower = room_body.lower()
         if any(word in room_body_lower for word in ["ничего", "пусто", "без", "none", "empty", "skip"]):
             rooms_prefs[room_id] = {"_skip": True}
+            logger.info(f"Parsed room {num}: SKIP")
             continue
 
         devs = _parse_room_segment(room_body)
         if devs:
+            logger.info(f"Parsed room {num}: {devs}")
             rooms_prefs[room_id] = devs
 
     rooms_list = [{"roomId": rid, "devices": devs} for rid, devs in rooms_prefs.items()]
