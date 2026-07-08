@@ -78,11 +78,24 @@ async def design(req: DesignRequest):
         room_map = DB.get("room_map", {}).get(project_id, {})
 
         # Если есть номера комнат в тексте и room_map — используем прямой парсер
-        has_numbers = bool(room_map and re.search(r"\d+\s*[:–-]", req.preferences_text))
-        if has_numbers:
-            prefs_graph = parse_numbered_preferences(req.preferences_text, room_map)
-            logger.info("NN-2: numbered preferences parsed, %d rooms", len(prefs_graph.get("rooms", [])))
+        # ИСПРАВЛЕНО: Всегда используем наш парсер если есть room_map
+        if room_map:
+            # Строим room_type_map из PlanGraph
+            room_type_map = {}
+            for room in plan_graph.get("rooms", []):
+                room_id = room.get("id")
+                room_type = room.get("roomType", "bedroom")
+                if room_id:
+                    room_type_map[room_id] = room_type
+
+            prefs_graph = parse_numbered_preferences(
+                req.preferences_text,
+                room_map,
+                room_type_map
+            )
+            logger.info("Preferences parsed, %d rooms", len(prefs_graph.get("rooms", [])))
         else:
+            # Fallback на NN-2 если нет room_map
             prefs_graph = _parse_preferences(req.preferences_text, project_id=project_id)
 
         DB.setdefault("preferences", {})[project_id] = prefs_graph
@@ -146,11 +159,25 @@ async def design_nn3(req: DesignRequest):
     prefs_graph = DB.get("preferences", {}).get(project_id)
     if req.preferences_text:
         room_map = DB.get("room_map", {}).get(project_id, {})
-        has_numbers = bool(room_map and re.search(r"\d+\s*[:–-]", req.preferences_text))
-        if has_numbers:
-            prefs_graph = parse_numbered_preferences(req.preferences_text, room_map)
+        # ИСПРАВЛЕНО: Всегда используем наш парсер если есть room_map
+        if room_map:
+            # Строим room_type_map из PlanGraph
+            room_type_map = {}
+            for room in plan_graph.get("rooms", []):
+                room_id = room.get("id")
+                room_type = room.get("roomType", "bedroom")
+                if room_id:
+                    room_type_map[room_id] = room_type
+
+            prefs_graph = parse_numbered_preferences(
+                req.preferences_text,
+                room_map,
+                room_type_map
+            )
+            logger.info("Preferences parsed, %d rooms", len(prefs_graph.get("rooms", [])))
         else:
             prefs_graph = _parse_preferences(req.preferences_text, project_id=project_id)
+
         DB.setdefault("preferences", {})[project_id] = prefs_graph
 
     if not _NN3_AVAILABLE or not nn3_run_placement:

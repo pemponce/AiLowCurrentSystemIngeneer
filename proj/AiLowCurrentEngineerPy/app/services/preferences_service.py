@@ -1,9 +1,13 @@
 # app/services/preferences_service.py
 """
-Парсинг пожеланий клиента (numbered preferences).
+Парсинг пожеланий клиента (numbered preferences) v2.
 
-Поддерживает формат:
-  "1: телевизор, свет; 2: свет, 2 ночника; 3: ничего"
+НОВОЕ: Поддержка названий комнат!
+
+Поддерживает форматы:
+  "1: телевизор, свет; 2: свет, 2 ночника"           ← цифры (старый)
+  "прихожая: свет, розетки; туалет: свет"           ← названия (новый!)
+  "1=прихожая: свет; 2=туалет: свет"                ← смешанный
 """
 
 import re
@@ -11,24 +15,76 @@ import logging
 
 logger = logging.getLogger("planner")
 
+# ========== СЛОВАРЬ СИНОНИМОВ КОМНАТ ==========
 
-def parse_numbered_preferences(text: str, room_map: dict) -> dict:
+ROOM_TYPE_ALIASES = {
+    # Гостиная
+    "гостиная": "living_room",
+    "гостинная": "living_room",
+    "гостинка": "living_room",
+    "зал": "living_room",
+    "холл": "living_room",
+    "гостиную": "living_room",
+    "зала": "living_room",
+
+    # Спальня
+    "спальня": "bedroom",
+    "спалня": "bedroom",
+    "спальню": "bedroom",
+    "комната": "bedroom",
+    "детская": "bedroom",
+    "детскую": "bedroom",
+
+    # Кухня
+    "кухня": "kitchen",
+    "кух": "kitchen",
+    "кухню": "kitchen",
+    "кухне": "kitchen",
+
+    # Ванная
+    "ванная": "bathroom",
+    "ванна": "bathroom",
+    "ванну": "bathroom",
+    "ванной": "bathroom",
+
+    # Туалет
+    "туалет": "toilet",
+    "санузел": "toilet",
+    "уборная": "toilet",
+    "wc": "toilet",
+    "туалете": "toilet",
+
+    # Прихожая / Коридор
+    "прихожая": "corridor",
+    "коридор": "corridor",
+    "прихожей": "corridor",
+    "прих": "corridor",
+    "коридоре": "corridor",
+
+    # Балкон
+    "балкон": "balcony",
+    "лоджия": "balcony",
+    "балконе": "balcony",
+}
+
+
+def parse_numbered_preferences(text: str, room_map: dict, room_type_map: dict = None) -> dict:
     """
-    Парсит текст пожеланий с номерами комнат.
+    Парсит текст пожеланий с номерами или названиями комнат.
 
     Args:
-        text: Текст вида "1: свет розетки; 2: ничего; 3: свет 2 розетки"
+        text: Текст вида:
+            - "1: свет розетки; 2: ничего; 3: свет 2 розетки"  (цифры)
+            - "прихожая: свет, розетки; туалет: свет"          (названия)
+            - "1=прихожая: свет; 2=туалет: свет"               (смешанный)
         room_map: Маппинг {1: "room_000", 2: "room_001", ...}
+        room_type_map: Маппинг {"room_000": "living_room", ...}
 
     Returns:
         PreferencesGraph dict с маркерами "_skip" для комнат с "ничего"
-
-    Supported patterns:
-        - "2 ночника" → night_lights: 2
-        - "2-4 источника света" → ceiling_lights: 3 (среднее)
-        - "телевизор" → tv_sockets: 1
-        - "ничего", "пусто", "без" → {"_skip": True}
     """
+    room_type_map = room_type_map or {}
+
 
     # Устройства: список (паттерн_regex, device_key)
     DEVICE_PATTERNS = [
@@ -56,6 +112,11 @@ def parse_numbered_preferences(text: str, room_map: dict) -> dict:
         (r"дым\b", "smoke_detector"),
         (r"пожарн", "smoke_detector"),
     ]
+
+    logger.info(f"PARSE START: text='{text}'")
+    logger.info(f"  room_map={room_map}")
+    logger.info(f"  room_type_map={room_type_map}")
+
 
     def _parse_count(token: str) -> int:
         """Извлекает число из токена: '2', '2-4' → среднее=3, 'два'=2."""
@@ -104,37 +165,96 @@ def parse_numbered_preferences(text: str, room_map: dict) -> dict:
 
         return result
 
+    def _find_room_by_type(room_type: str) -> str:
+        """Находит первую комнату указанного типа."""
+        for room_id, rtype in room_type_map.items():
+            if rtype == room_type:
+                return room_id
+        # Fallback: если не нашли — возвращаем первую комнату
+        if room_map:
+            return room_map.get(1, "")
+        return ""
+
     # Разбиваем на сегменты по ";" или "\n"
     segments = [s.strip() for s in re.split(r"[;\n]", text) if s.strip()]
     rooms_prefs = {}
 
     for seg in segments:
-        # Ищем номер комнаты: "1:", "комната 2:", "1 -"
-        m = re.match(
-            r"(?:комната\s*)?(\d+)\s*[:\-–—]?\s*(.*)",
+        # ========== ПАРСИНГ КОМНАТЫ ==========
+
+        # Вариант 1: "1=прихожая: свет" (явное указание)
+        m_explicit = re.match(
+            r"(\d+)\s*=\s*([а-яА-ЯёЁa-zA-Z]+)\s*:\s*(.*)",
             seg.strip(),
             re.IGNORECASE | re.DOTALL
         )
-        if not m:
-            continue
 
-        num = int(m.group(1))
-        room_body = m.group(2).strip()
-        room_id = room_map.get(num)
+        # Вариант 2: "прихожая: свет" (только название)
+        m_name = re.match(
+            r"([а-яА-ЯёЁa-zA-Z]+)\s*:\s*(.*)",
+            seg.strip(),
+            re.IGNORECASE | re.DOTALL
+        )
+
+        # Вариант 3: "1: свет" (только цифра)
+        m_num = re.match(
+            r"(\d+)\s*:\s*(.*)",
+            seg.strip(),
+            re.IGNORECASE | re.DOTALL
+        )
+
+        room_id = None
+        room_body = None
+
+        if m_explicit:
+            # Формат: "1=прихожая: свет"
+            num = int(m_explicit.group(1))
+            room_name = m_explicit.group(2).strip().lower()
+            room_body = m_explicit.group(3).strip()
+
+            # Используем номер из room_map
+            room_id = room_map.get(num)
+
+            logger.debug(f"Parsed explicit: num={num}, name={room_name}, room_id={room_id}")
+
+        elif m_name and not m_num:
+            # Формат: "прихожая: свет" (только название, без цифры)
+            room_name = m_name.group(1).strip().lower()
+            room_body = m_name.group(2).strip()
+
+            # Ищем тип комнаты по названию
+            room_type = ROOM_TYPE_ALIASES.get(room_name)
+            if room_type:
+                # Находим первую комнату этого типа
+                room_id = _find_room_by_type(room_type)
+                logger.debug(f"Parsed name: name={room_name}, type={room_type}, room_id={room_id}")
+            else:
+                logger.warning(f"Unknown room name: {room_name}")
+                continue
+
+        elif m_num:
+            # Формат: "1: свет" (только цифра)
+            num = int(m_num.group(1))
+            room_body = m_num.group(2).strip()
+            room_id = room_map.get(num)
+
+            logger.debug(f"Parsed number: num={num}, room_id={room_id}")
 
         if not room_id or not room_body:
             continue
+
+        # ========== ПАРСИНГ УСТРОЙСТВ ==========
 
         # Проверка на "ничего", "пусто", "без"
         room_body_lower = room_body.lower()
         if any(word in room_body_lower for word in ["ничего", "пусто", "без", "none", "empty", "skip"]):
             rooms_prefs[room_id] = {"_skip": True}
-            logger.info(f"Parsed room {num}: SKIP")
+            logger.info(f"Parsed room {room_id}: SKIP")
             continue
 
         devs = _parse_room_segment(room_body)
         if devs:
-            logger.info(f"Parsed room {num}: {devs}")
+            logger.info(f"Parsed room {room_id}: {devs}")
             rooms_prefs[room_id] = devs
 
     rooms_list = [{"roomId": rid, "devices": devs} for rid, devs in rooms_prefs.items()]
