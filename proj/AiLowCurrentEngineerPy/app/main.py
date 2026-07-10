@@ -21,6 +21,7 @@ from app.api_endpoints.upload import router as upload_router
 from app.api_endpoints.ingest import router as ingest_router
 from app.api_endpoints.design import router as design_router
 from app.api_endpoints.export import router as export_router
+from app.api_endpoints.panel import router as panel_router
 
 # Глобальное хранилище
 from app.geometry import DB
@@ -85,6 +86,7 @@ app.include_router(upload_router)
 app.include_router(ingest_router)
 app.include_router(design_router)
 app.include_router(export_router)
+app.include_router(panel_router)
 
 # Старые роутеры (совместимость)
 app.include_router(compare_router)
@@ -133,6 +135,28 @@ async def startup_event():
     os.makedirs("/tmp/exports", exist_ok=True)
     os.makedirs("/data", exist_ok=True)
 
+    # Восстанавливаем DB["source"] из SQLite (после рестарта контейнера)
+    try:
+        from app.db import get_db
+        from app.geometry import DB
+        with get_db() as conn:
+            rows = conn.execute("SELECT id, src_key, local_path FROM projects").fetchall()
+        restored = 0
+        for row in rows:
+            pid = row["id"]
+            lp  = row["local_path"]
+            sk  = row["src_key"]
+            if pid and lp:
+                DB.setdefault("source", {})[pid] = {
+                    "src_key": sk or "",
+                    "local_path": lp,
+                }
+                restored += 1
+        if restored:
+            logger.info("Restored DB[source] for %d projects from SQLite", restored)
+    except Exception as e:
+        logger.warning("Could not restore DB[source] from SQLite: %s", e)
+
 
 # Shutdown event
 @app.on_event("shutdown")
@@ -162,6 +186,49 @@ async def root():
             "nn2": _NN2_AVAILABLE,
             "nn3": _NN3_AVAILABLE,
             "sqlite": _SQLITE_OK,
+        },
+    }
+
+
+@app.get("/cable_spec/{project_id}")
+async def get_cable_spec(project_id: str):
+    """Спецификация кабеля по группам цепей (метраж в м/см/мм)."""
+    from app.routing import route_all, build_cable_spec, build_cable_spec_text
+    routes = DB.get("routes", {}).get(project_id)
+    if routes is None:
+        # Строим трассы если ещё не были построены
+        routes = route_all(project_id)
+    cable_spec = build_cable_spec(routes, project_id=project_id)
+    spec_text  = build_cable_spec_text(cable_spec)
+    return {
+        "project_id":    project_id,
+        "spec":          cable_spec,
+        "spec_text":     spec_text,
+        "routes_count":  len(routes),
+    }
+
+
+@app.post("/route/{project_id}")
+async def rebuild_routes(project_id: str):
+    """Перестроить трассы кабелей для проекта (без экспорта)."""
+    from app.routing import route_all, build_cable_spec, build_cable_spec_text
+    routes = route_all(project_id)
+    cable_spec = build_cable_spec(routes, project_id=project_id)
+    return {
+        "project_id":   project_id,
+        "routes_count": len(routes),
+        "cable_summary": {
+            "total_m":  cable_spec["grand_total_m"],
+            "total_cm": cable_spec["grand_total_cm"],
+            "total_mm": cable_spec["grand_total_mm"],
+            "by_group": {
+                g: {
+                    "label":   cable_spec["groups"][g]["label_ru"],
+                    "total_m": cable_spec["groups"][g]["total_m"],
+                    "devices": cable_spec["groups"][g]["device_count"],
+                }
+                for g in cable_spec["groups"]
+            },
         },
     }
 

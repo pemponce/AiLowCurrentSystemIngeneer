@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Позиция щитка — AI Low-Current Engineer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f1117;
+    color: #e2e8f0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── Шапка ── */
+  .header {
+    background: #1a1d2e;
+    border-bottom: 1px solid #2d3148;
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-shrink: 0;
+  }
+  .header h1 {
+    font-size: 15px;
+    font-weight: 600;
+    color: #a5b4fc;
+    letter-spacing: 0.3px;
+  }
+  .badge {
+    background: #312e81;
+    color: #c7d2fe;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 500;
+  }
+
+  /* ── Основной layout ── */
+  .layout {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* ── Сайдбар ── */
+  .sidebar {
+    width: 280px;
+    background: #1a1d2e;
+    border-right: 1px solid #2d3148;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    overflow-y: auto;
+  }
+
+  .sidebar-section {
+    padding: 16px;
+    border-bottom: 1px solid #2d3148;
+  }
+  .sidebar-section h2 {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: #64748b;
+    margin-bottom: 12px;
+  }
+
+  .input-group {
+    margin-bottom: 10px;
+  }
+  .input-group label {
+    display: block;
+    font-size: 12px;
+    color: #94a3b8;
+    margin-bottom: 4px;
+  }
+  .input-group input {
+    width: 100%;
+    background: #0f1117;
+    border: 1px solid #2d3148;
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 13px;
+    color: #e2e8f0;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .input-group input:focus {
+    border-color: #6366f1;
+  }
+
+  .btn {
+    width: 100%;
+    padding: 9px 14px;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn-primary {
+    background: #4f46e5;
+    color: #fff;
+  }
+  .btn-primary:hover { background: #4338ca; }
+  .btn-primary:disabled { background: #312e81; color: #6366f1; cursor: not-allowed; }
+
+  .btn-secondary {
+    background: #1e293b;
+    color: #94a3b8;
+    border: 1px solid #2d3148;
+    margin-top: 8px;
+  }
+  .btn-secondary:hover { background: #273449; color: #e2e8f0; }
+
+  /* ── Координаты ── */
+  .coords-display {
+    background: #0f1117;
+    border: 1px solid #2d3148;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+  }
+  .coords-display .label {
+    font-size: 11px;
+    color: #64748b;
+    margin-bottom: 4px;
+  }
+  .coords-display .value {
+    font-size: 20px;
+    font-weight: 700;
+    color: #a5b4fc;
+    font-variant-numeric: tabular-nums;
+  }
+  .coords-display .value span {
+    font-size: 13px;
+    color: #64748b;
+    font-weight: 400;
+  }
+
+  /* ── Статус ── */
+  .status-box {
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .status-idle    { background: #1e293b; color: #94a3b8; border: 1px solid #2d3148; }
+  .status-ready   { background: #14532d; color: #86efac; border: 1px solid #166534; }
+  .status-success { background: #1e3a5f; color: #93c5fd; border: 1px solid #1e40af; }
+  .status-error   { background: #450a0a; color: #fca5a5; border: 1px solid #7f1d1d; }
+
+  /* ── Инструкция ── */
+  .instruction {
+    background: #1a1d2e;
+    border-left: 3px solid #4f46e5;
+    padding: 10px 12px;
+    font-size: 12px;
+    color: #94a3b8;
+    line-height: 1.6;
+    border-radius: 0 6px 6px 0;
+  }
+  .instruction strong { color: #c7d2fe; }
+
+  /* ── Легенда ── */
+  .legend { display: flex; flex-direction: column; gap: 6px; }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #94a3b8; }
+  .legend-dot {
+    width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0;
+  }
+
+  /* ── Canvas область ── */
+  .canvas-area {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    background: #070a0f;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  #planCanvas {
+    position: absolute;
+    top: 0; left: 0;
+    cursor: crosshair;
+    transform-origin: 0 0;
+    image-rendering: pixelated;
+  }
+
+  .canvas-hint {
+    color: #374151;
+    font-size: 14px;
+    text-align: center;
+    pointer-events: none;
+    user-select: none;
+  }
+  .canvas-hint .icon { font-size: 40px; margin-bottom: 12px; }
+
+  /* ── Зум-контролы ── */
+  .zoom-controls {
+    position: absolute;
+    bottom: 16px;
+    right: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .zoom-btn {
+    width: 32px; height: 32px;
+    background: #1a1d2e;
+    border: 1px solid #2d3148;
+    border-radius: 6px;
+    color: #94a3b8;
+    font-size: 16px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.15s;
+  }
+  .zoom-btn:hover { background: #273449; color: #e2e8f0; }
+
+  /* ── Шкала ── */
+  .scale-info {
+    position: absolute;
+    bottom: 16px;
+    left: 16px;
+    background: rgba(15, 17, 23, 0.85);
+    border: 1px solid #2d3148;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    color: #64748b;
+  }
+
+  .history-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 120px;
+    overflow-y: auto;
+  }
+  .history-item {
+    font-size: 11px;
+    color: #64748b;
+    background: #0f1117;
+    border-radius: 4px;
+    padding: 4px 8px;
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .history-item:hover { background: #1e293b; color: #94a3b8; }
+</style>
+</head>
+<body>
+
+<!-- Шапка -->
+<div class="header">
+  <h1>⚡ Позиция щитка</h1>
+  <span class="badge">AI Low-Current Engineer</span>
+  <span style="margin-left:auto;font-size:12px;color:#64748b" id="zoomLabel">100%</span>
+</div>
+
+<!-- Layout -->
+<div class="layout">
+
+  <!-- Сайдбар -->
+  <div class="sidebar">
+
+    <!-- Проект -->
+    <div class="sidebar-section">
+      <h2>Проект</h2>
+      <div class="input-group">
+        <label>Project ID</label>
+        <input type="text" id="projectIdInput" value="" placeholder="plan001">
+      </div>
+      <button class="btn btn-primary" onclick="loadPlan()">Загрузить план</button>
+    </div>
+
+    <!-- Координаты -->
+    <div class="sidebar-section">
+      <h2>Позиция щитка</h2>
+      <div class="coords-display">
+        <div class="label">X, Y (пиксели)</div>
+        <div class="value" id="coordsDisplay">— <span>не выбрано</span></div>
+      </div>
+      <div class="input-group">
+        <label>Метка</label>
+        <input type="text" id="panelLabel" value="Щиток ГРЩ" placeholder="Щиток ГРЩ">
+      </div>
+      <button class="btn btn-primary" id="saveBtn" onclick="savePanel()" disabled>
+        💾 Сохранить позицию
+      </button>
+      <button class="btn btn-secondary" onclick="clearMark()">✕ Сбросить метку</button>
+    </div>
+
+    <!-- Статус -->
+    <div class="sidebar-section">
+      <h2>Статус</h2>
+      <div class="status-box status-idle" id="statusBox">
+        Введите Project ID и нажмите «Загрузить план»
+      </div>
+    </div>
+
+    <!-- Инструкция -->
+    <div class="sidebar-section">
+      <h2>Как использовать</h2>
+      <div class="instruction">
+        1. Введите <strong>Project ID</strong> (из /ingest)<br>
+        2. Нажмите <strong>Загрузить план</strong><br>
+        3. <strong>Кликните на плане</strong> где находится щиток (обычно у входной двери)<br>
+        4. Нажмите <strong>Сохранить позицию</strong><br>
+        5. Запустите <strong>POST /export</strong> — трассы пересчитаются
+      </div>
+    </div>
+
+    <!-- Легенда -->
+    <div class="sidebar-section">
+      <h2>Легенда</h2>
+      <div class="legend">
+        <div class="legend-item">
+          <div class="legend-dot" style="background:#ef4444"></div>
+          Щиток (выбранная позиция)
+        </div>
+        <div class="legend-item">
+          <div class="legend-dot" style="background:#f59e0b;border-radius:2px"></div>
+          Текущий щиток из DB
+        </div>
+      </div>
+    </div>
+
+    <!-- История -->
+    <div class="sidebar-section" id="historySection" style="display:none">
+      <h2>История кликов</h2>
+      <div class="history-list" id="historyList"></div>
+    </div>
+
+  </div>
+
+  <!-- Canvas -->
+  <div class="canvas-area" id="canvasArea">
+    <div class="canvas-hint" id="canvasHint">
+      <div class="icon">🗺️</div>
+      Загрузите план квартиры<br>чтобы выбрать позицию щитка
+    </div>
+    <canvas id="planCanvas" style="display:none"></canvas>
+
+    <!-- Зум -->
+    <div class="zoom-controls">
+      <button class="zoom-btn" onclick="zoom(1.25)" title="Увеличить">+</button>
+      <button class="zoom-btn" onclick="zoom(1/1.25)" title="Уменьшить">−</button>
+      <button class="zoom-btn" onclick="resetZoom()" title="Сброс">⊙</button>
+    </div>
+
+    <div class="scale-info" id="scaleInfo" style="display:none">
+      Колесо мыши — зум · Ctrl+клик — сброс
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── Состояние ──────────────────────────────────────────────────────────────
+const state = {
+  projectId: "",
+  imageUrl: "",
+  img: null,
+  scale: 1,
+  offsetX: 0,
+  offsetY: 0,
+  markX: null,
+  markY: null,
+  existingPanel: null,
+  dragging: false,
+  dragStart: null,
+  clickHistory: [],
+};
+
+// ── DOM ───────────────────────────────────────────────────────────────────
+const canvas   = document.getElementById("planCanvas");
+const ctx      = canvas.getContext("2d");
+const hint     = document.getElementById("canvasHint");
+const statusBox = document.getElementById("statusBox");
+const coordsDisplay = document.getElementById("coordsDisplay");
+const saveBtn  = document.getElementById("saveBtn");
+
+// ── Инициализация из URL params ───────────────────────────────────────────
+window.addEventListener("load", () => {
+  const params = new URLSearchParams(window.location.search);
+  const pid = params.get("project_id") || params.get("projectId") || "";
+  if (pid) {
+    document.getElementById("projectIdInput").value = pid;
+    loadPlan();
+  }
+});
+
+// ── Загрузка плана ────────────────────────────────────────────────────────
+async function loadPlan() {
+  const pid = document.getElementById("projectIdInput").value.trim();
+  if (!pid) { setStatus("error", "Введите Project ID"); return; }
+
+  state.projectId = pid;
+  setStatus("idle", "Загрузка плана...");
+
+  // Получаем URL numbered плана
+  let imageUrl;
+  try {
+    const r = await fetch(`/panel/numbered_url/${pid}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    imageUrl = data.url;
+  } catch (e) {
+    setStatus("error", `Не удалось получить план: ${e.message}<br>Убедитесь что выполнен /ingest для этого проекта`);
+    return;
+  }
+
+  // Загружаем изображение
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  img.onload = () => {
+    state.img = img;
+    state.imageUrl = imageUrl;
+    initCanvas();
+    loadExistingPanel();
+    setStatus("ready", `План загружен (${img.width}×${img.height}px)<br>Кликните на план чтобы выбрать позицию щитка`);
+  };
+  img.onerror = () => {
+    setStatus("error", `Не удалось загрузить изображение<br>URL: ${imageUrl}`);
+  };
+  img.src = imageUrl;
+}
+
+// ── Загрузка существующего щитка ─────────────────────────────────────────
+async function loadExistingPanel() {
+  try {
+    const r = await fetch(`/panel/info/${state.projectId}`);
+    if (r.ok) {
+      const data = await r.json();
+      state.existingPanel = data.panel;
+      redraw();
+    }
+  } catch (e) {
+    // Нет щитка — нормально
+  }
+}
+
+// ── Инициализация canvas ─────────────────────────────────────────────────
+function initCanvas() {
+  const area = document.getElementById("canvasArea");
+  const aw = area.clientWidth;
+  const ah = area.clientHeight;
+
+  // Вписываем изображение в область
+  const scaleX = aw / state.img.width;
+  const scaleY = ah / state.img.height;
+  state.scale = Math.min(scaleX, scaleY) * 0.95;
+
+  state.offsetX = (aw - state.img.width * state.scale) / 2;
+  state.offsetY = (ah - state.img.height * state.scale) / 2;
+
+  canvas.width  = aw;
+  canvas.height = ah;
+
+  hint.style.display   = "none";
+  canvas.style.display = "block";
+  document.getElementById("scaleInfo").style.display = "block";
+
+  redraw();
+  updateZoomLabel();
+}
+
+// ── Рисуем canvas ────────────────────────────────────────────────────────
+function redraw() {
+  if (!state.img) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  ctx.save();
+  ctx.translate(state.offsetX, state.offsetY);
+  ctx.scale(state.scale, state.scale);
+  ctx.drawImage(state.img, 0, 0);
+
+  // Существующий щиток из DB (жёлтый ромб)
+  if (state.existingPanel) {
+    const ex = state.existingPanel.x;
+    const ey = state.existingPanel.y;
+    drawMarker(ex, ey, "#f59e0b", "Текущий щиток", false);
+  }
+
+  // Новая отметка (красный крест)
+  if (state.markX !== null) {
+    drawMarker(state.markX, state.markY, "#ef4444", "Новый щиток", true);
+  }
+
+  ctx.restore();
+}
+
+function drawMarker(x, y, color, label, isPrimary) {
+  const r = isPrimary ? 14 : 10;
+
+  // Внешнее кольцо
+  ctx.beginPath();
+  ctx.arc(x, y, r + 3, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(0,0,0,0.4)";
+  ctx.fill();
+
+  // Цветной круг
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+
+  // Крест внутри
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = isPrimary ? 2.5 : 2;
+  const arm = r * 0.55;
+  ctx.beginPath();
+  ctx.moveTo(x - arm, y); ctx.lineTo(x + arm, y);
+  ctx.moveTo(x, y - arm); ctx.lineTo(x, y + arm);
+  ctx.stroke();
+
+  // Метка
+  ctx.font = `bold ${isPrimary ? 13 : 11}px -apple-system, sans-serif`;
+  ctx.fillStyle = "#fff";
+  ctx.textAlign = "center";
+  ctx.shadowColor = "rgba(0,0,0,0.8)";
+  ctx.shadowBlur = 4;
+  ctx.fillText(label, x, y - r - 8);
+  ctx.shadowBlur = 0;
+
+  // Координаты под меткой
+  ctx.font = `${isPrimary ? 11 : 10}px -apple-system, sans-serif`;
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  ctx.fillText(`(${Math.round(x)}, ${Math.round(y)})`, x, y + r + 14);
+}
+
+// ── Конвертация координат canvas → изображение ───────────────────────────
+function canvasToImage(cx, cy) {
+  return {
+    x: (cx - state.offsetX) / state.scale,
+    y: (cy - state.offsetY) / state.scale,
+  };
+}
+
+// ── Клик по canvas ───────────────────────────────────────────────────────
+canvas.addEventListener("click", (e) => {
+  if (!state.img) return;
+  if (state.dragging) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const cx = e.clientX - rect.left;
+  const cy = e.clientY - rect.top;
+  const { x, y } = canvasToImage(cx, cy);
+
+  // Проверяем что клик внутри изображения
+  if (x < 0 || y < 0 || x > state.img.width || y > state.img.height) return;
+
+  state.markX = x;
+  state.markY = y;
+
+  // История
+  state.clickHistory.unshift({ x: Math.round(x), y: Math.round(y) });
+  if (state.clickHistory.length > 5) state.clickHistory.pop();
+  updateHistory();
+
+  coordsDisplay.innerHTML = `${Math.round(x)}, ${Math.round(y)} <span>px</span>`;
+  saveBtn.disabled = false;
+
+  setStatus("ready", `Выбрана точка (${Math.round(x)}, ${Math.round(y)})<br>Нажмите «Сохранить позицию»`);
+  redraw();
+});
+
+// ── Зум колесом ──────────────────────────────────────────────────────────
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mouseX = e.clientX - rect.left;
+  const mouseY = e.clientY - rect.top;
+
+  const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+  const newScale = Math.min(Math.max(state.scale * factor, 0.1), 10);
+
+  // Зумим относительно курсора
+  state.offsetX = mouseX - (mouseX - state.offsetX) * (newScale / state.scale);
+  state.offsetY = mouseY - (mouseY - state.offsetY) * (newScale / state.scale);
+  state.scale = newScale;
+
+  redraw();
+  updateZoomLabel();
+}, { passive: false });
+
+// ── Перетаскивание ───────────────────────────────────────────────────────
+canvas.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  state.dragging = false;
+  state.dragStart = { x: e.clientX, y: e.clientY, ox: state.offsetX, oy: state.offsetY };
+});
+
+canvas.addEventListener("mousemove", (e) => {
+  if (!state.dragStart) return;
+  const dx = e.clientX - state.dragStart.x;
+  const dy = e.clientY - state.dragStart.y;
+  if (Math.hypot(dx, dy) > 4) state.dragging = true;
+  if (state.dragging) {
+    state.offsetX = state.dragStart.ox + dx;
+    state.offsetY = state.dragStart.oy + dy;
+    redraw();
+  }
+});
+
+canvas.addEventListener("mouseup", () => { state.dragStart = null; });
+canvas.addEventListener("mouseleave", () => { state.dragStart = null; });
+
+// ── Зум кнопками ─────────────────────────────────────────────────────────
+function zoom(factor) {
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+  const newScale = Math.min(Math.max(state.scale * factor, 0.1), 10);
+  state.offsetX = cx - (cx - state.offsetX) * (newScale / state.scale);
+  state.offsetY = cy - (cy - state.offsetY) * (newScale / state.scale);
+  state.scale = newScale;
+  redraw();
+  updateZoomLabel();
+}
+
+function resetZoom() {
+  if (!state.img) return;
+  initCanvas();
+  updateZoomLabel();
+}
+
+function updateZoomLabel() {
+  document.getElementById("zoomLabel").textContent =
+    Math.round(state.scale * 100) + "%";
+}
+
+// ── Сброс метки ──────────────────────────────────────────────────────────
+function clearMark() {
+  state.markX = null;
+  state.markY = null;
+  saveBtn.disabled = true;
+  coordsDisplay.innerHTML = `— <span>не выбрано</span>`;
+  setStatus("idle", "Метка сброшена. Кликните на план для новой отметки.");
+  redraw();
+}
+
+// ── Сохранение позиции щитка ─────────────────────────────────────────────
+async function savePanel() {
+  if (state.markX === null || !state.projectId) return;
+
+  const label = document.getElementById("panelLabel").value.trim() || "Щиток ГРЩ";
+
+  setStatus("idle", "Сохранение...");
+  saveBtn.disabled = true;
+
+  try {
+    const r = await fetch("/panel/set", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId: state.projectId,
+        xPx: Math.round(state.markX),
+        yPx: Math.round(state.markY),
+        label: label,
+      }),
+    });
+
+    if (!r.ok) {
+      const err = await r.json();
+      throw new Error(err.error || `HTTP ${r.status}`);
+    }
+
+    const data = await r.json();
+
+    // Обновляем existingPanel
+    state.existingPanel = { x: state.markX, y: state.markY, label };
+    state.markX = null;
+    state.markY = null;
+
+    setStatus("success",
+      `✓ Позиция щитка сохранена!<br>` +
+      `X: ${Math.round(data.panel.x)}px, Y: ${Math.round(data.panel.y)}px<br>` +
+      `<br>Теперь запустите:<br>` +
+      `<code style="background:#0f1117;padding:2px 6px;border-radius:3px;font-size:11px">` +
+      `POST /export {"projectId":"${state.projectId}","formats":["PNG"]}</code>`
+    );
+
+    coordsDisplay.innerHTML = `— <span>сохранено</span>`;
+    redraw();
+
+  } catch (e) {
+    setStatus("error", `Ошибка сохранения: ${e.message}`);
+    saveBtn.disabled = false;
+  }
+}
+
+// ── История кликов ───────────────────────────────────────────────────────
+function updateHistory() {
+  if (state.clickHistory.length === 0) return;
+  document.getElementById("historySection").style.display = "block";
+  const list = document.getElementById("historyList");
+  list.innerHTML = state.clickHistory.map((p, i) =>
+    `<div class="history-item" onclick="restoreHistory(${i})">
+      ${i === 0 ? "▶ " : ""}(${p.x}, ${p.y})
+    </div>`
+  ).join("");
+}
+
+function restoreHistory(i) {
+  const p = state.clickHistory[i];
+  state.markX = p.x;
+  state.markY = p.y;
+  coordsDisplay.innerHTML = `${p.x}, ${p.y} <span>px</span>`;
+  saveBtn.disabled = false;
+  redraw();
+}
+
+// ── Статус ───────────────────────────────────────────────────────────────
+function setStatus(type, html) {
+  statusBox.className = `status-box status-${type}`;
+  statusBox.innerHTML = html;
+}
+
+// ── Enter в поле projectId ────────────────────────────────────────────────
+document.getElementById("projectIdInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") loadPlan();
+});
+</script>
+</body>
+</html>

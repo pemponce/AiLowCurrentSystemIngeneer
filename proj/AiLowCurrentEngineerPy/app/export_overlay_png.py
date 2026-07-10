@@ -602,27 +602,80 @@ def export_overlay_png(
     # Размещаем устройства
     placed = _place_devices_on_plan(devices, room_centroids, rooms, icon_r=icon_r)
 
-    # Рисуем трассы (если есть)
+    # Рисуем трассы (если есть) — цветные линии по группам цепей
+    # Порядок: сначала слаботочка, потом розетки, потом освещение (поверх)
+    GROUP_ORDER = ["low_voltage", "sockets", "lighting"]
+    DEFAULT_COLORS = {
+        "lighting":    (0, 0, 220),    # красный (BGR)
+        "sockets":     (220, 50, 0),   # синий (BGR)
+        "low_voltage": (0, 200, 220),  # жёлтый (BGR)
+    }
+    routes_by_group = {g: [] for g in GROUP_ORDER}
+    routes_other = []
+
     for route in routes or []:
-        points = None
         if isinstance(route, dict):
-            points = route.get("points") or route.get("polyline")
-        elif isinstance(route, (list, tuple)) and len(route) >= 2:
-            line = route[1]
+            g = route.get("group", "")
+            if g in routes_by_group:
+                routes_by_group[g].append(route)
+            else:
+                routes_other.append(route)
+        else:
+            routes_other.append(route)
+
+    def _draw_route(route_item):
+        points = None
+        color  = (0, 0, 200)
+        thickness = 2
+        if isinstance(route_item, dict):
+            points    = route_item.get("points") or route_item.get("polyline")
+            color     = route_item.get("color_bgr", DEFAULT_COLORS.get(route_item.get("group", ""), (0,0,200)))
+            thickness = route_item.get("line_thickness", 2)
+        elif isinstance(route_item, (list, tuple)) and len(route_item) >= 2:
+            line = route_item[1]
             if hasattr(line, "coords"):
                 points = [(int(x), int(y)) for x, y in line.coords]
         if not points or len(points) < 2:
-            continue
+            return
         for a, b in zip(points, points[1:]):
             try:
-                cv2.line(img,
-                         (int(a[0] if isinstance(a, (list,tuple)) else a["x"]),
-                          int(a[1] if isinstance(a, (list,tuple)) else a["y"])),
-                         (int(b[0] if isinstance(b, (list,tuple)) else b["x"]),
-                          int(b[1] if isinstance(b, (list,tuple)) else b["y"])),
-                         (0, 0, 200), 2)
+                ax = int(a[0] if isinstance(a, (list, tuple)) else a["x"])
+                ay = int(a[1] if isinstance(a, (list, tuple)) else a["y"])
+                bx = int(b[0] if isinstance(b, (list, tuple)) else b["x"])
+                by = int(b[1] if isinstance(b, (list, tuple)) else b["y"])
+                cv2.line(img, (ax, ay), (bx, by), color, thickness, cv2.LINE_AA)
             except Exception:
                 pass
+
+    for g in GROUP_ORDER:
+        for r in routes_by_group[g]:
+            _draw_route(r)
+    for r in routes_other:
+        _draw_route(r)
+
+    # Легенда групп цепей (правый нижний угол)
+    legend_groups = [g for g in GROUP_ORDER if routes_by_group.get(g)]
+    if legend_groups:
+        GROUP_LABELS = {
+            "lighting":    "Освещение (SVT/SWI)",
+            "sockets":     "Розетки (RZT/LAN/TV)",
+            "low_voltage": "Слаботочка (DYM/CO2)",
+        }
+        row_h = 18
+        pad   = 8
+        lw    = 200
+        lh    = len(legend_groups) * row_h + pad * 2
+        lx    = w - lw - 10
+        ly    = h - lh - 10
+        cv2.rectangle(img, (lx, ly), (lx + lw, ly + lh), (255, 255, 255), -1)
+        cv2.rectangle(img, (lx, ly), (lx + lw, ly + lh), (160, 160, 160), 1)
+        for i, g in enumerate(legend_groups):
+            cy_leg = ly + pad + i * row_h + row_h // 2
+            color  = DEFAULT_COLORS.get(g, (100, 100, 100))
+            cv2.line(img, (lx + pad, cy_leg), (lx + pad + 20, cy_leg), color, 2, cv2.LINE_AA)
+            cv2.putText(img, GROUP_LABELS.get(g, g),
+                        (lx + pad + 26, cy_leg + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (30, 30, 30), 1, cv2.LINE_AA)
 
     # Рисуем устройства
     # Убираем наложения — минимальный шаг между иконками

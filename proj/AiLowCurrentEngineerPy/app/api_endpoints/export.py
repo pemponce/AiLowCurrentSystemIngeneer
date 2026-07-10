@@ -11,6 +11,7 @@ from app.export_overlay_png import export_overlay_png
 from app.export_pdf import export_pdf
 from app.export_dxf import export_dxf
 from app.minio_client import upload_file, EXPORT_BUCKET
+from app.routing import route_all, build_cable_spec, build_cable_spec_text
 
 logger = logging.getLogger("planner")
 router = APIRouter(tags=["export"])
@@ -77,6 +78,22 @@ async def export(req: APIExportRequest):
         if not base_image_path:
             raise Exception(f"No source image for project {req.project_id}")
 
+        # ── Маршрутизация кабелей ─────────────────────────────────────────
+        # Перестраиваем трассы при каждом экспорте, чтобы учесть свежий DesignGraph
+        logger.info("Building cable routes for project %s", req.project_id)
+        routes = route_all(req.project_id)
+        logger.info("Routes built: %d segments", len(routes))
+
+        # ── Спецификация кабеля ───────────────────────────────────────────
+        cable_spec = build_cable_spec(routes, project_id=req.project_id)
+        spec_text  = build_cable_spec_text(cable_spec)
+        spec_path  = f"/tmp/exports/{req.project_id}_cable_spec.txt"
+        os.makedirs("/tmp/exports", exist_ok=True)
+        with open(spec_path, "w", encoding="utf-8") as f:
+            f.write(spec_text)
+        spec_uri = upload_file(EXPORT_BUCKET, spec_path, f"drawings/{req.project_id}_cable_spec.txt")
+        DB.setdefault("cable_spec", {})[req.project_id] = cable_spec
+
         exports = {}
         os.makedirs("/tmp/exports", exist_ok=True)
 
@@ -122,6 +139,20 @@ async def export(req: APIExportRequest):
         return {
             "project_id": req.project_id,
             "exports": exports,
+            "cable_spec": spec_uri,
+            "cable_summary": {
+                "total_m":   cable_spec["grand_total_m"],
+                "total_cm":  cable_spec["grand_total_cm"],
+                "total_mm":  cable_spec["grand_total_mm"],
+                "by_group": {
+                    g: {
+                        "label":    cable_spec["groups"][g]["label_ru"],
+                        "total_m":  cable_spec["groups"][g]["total_m"],
+                        "devices":  cable_spec["groups"][g]["device_count"],
+                    }
+                    for g in cable_spec["groups"]
+                },
+            },
             "devices_count": len(devices),
             "rooms_count": len(sorted_rooms),
         }

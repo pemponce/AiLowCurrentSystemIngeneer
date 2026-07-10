@@ -91,7 +91,8 @@ async def design(req: DesignRequest):
             prefs_graph = parse_numbered_preferences(
                 req.preferences_text,
                 room_map,
-                room_type_map
+                room_type_map,
+                project_id=project_id,
             )
             logger.info("Preferences parsed, %d rooms", len(prefs_graph.get("rooms", [])))
         else:
@@ -172,7 +173,8 @@ async def design_nn3(req: DesignRequest):
             prefs_graph = parse_numbered_preferences(
                 req.preferences_text,
                 room_map,
-                room_type_map
+                room_type_map,
+                project_id=project_id,
             )
             logger.info("Preferences parsed, %d rooms", len(prefs_graph.get("rooms", [])))
         else:
