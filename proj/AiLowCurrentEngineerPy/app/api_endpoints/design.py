@@ -9,6 +9,7 @@ from typing import Optional
 
 from app.placement import _apply_hard_rules
 from app.services.preferences_service import parse_numbered_preferences
+from app.services.default_preferences import build_default_prefs
 
 logger = logging.getLogger("planner")
 router = APIRouter(tags=["design"])
@@ -74,13 +75,10 @@ async def design(req: DesignRequest):
 
     # NN-2: парсим пожелания
     prefs_graph = DB.get("preferences", {}).get(project_id)
-    if req.preferences_text:
+    if req.preferences_text and req.preferences_text.strip():
         room_map = DB.get("room_map", {}).get(project_id, {})
 
-        # Если есть номера комнат в тексте и room_map — используем прямой парсер
-        # ИСПРАВЛЕНО: Всегда используем наш парсер если есть room_map
         if room_map:
-            # Строим room_type_map из PlanGraph
             room_type_map = {}
             for room in plan_graph.get("rooms", []):
                 room_id = room.get("id")
@@ -96,9 +94,14 @@ async def design(req: DesignRequest):
             )
             logger.info("Preferences parsed, %d rooms", len(prefs_graph.get("rooms", [])))
         else:
-            # Fallback на NN-2 если нет room_map
             prefs_graph = _parse_preferences(req.preferences_text, project_id=project_id)
 
+        DB.setdefault("preferences", {})[project_id] = prefs_graph
+
+    else:
+        # Пользователь не указал предпочтения → нормативная расстановка по ГОСТ/ПУЭ
+        logger.info("No preferences text — using normative defaults (GOST/PUE)")
+        prefs_graph = build_default_prefs(rooms)
         DB.setdefault("preferences", {})[project_id] = prefs_graph
 
     # NN-3: размещение устройств
@@ -173,8 +176,7 @@ async def design_nn3(req: DesignRequest):
             prefs_graph = parse_numbered_preferences(
                 req.preferences_text,
                 room_map,
-                room_type_map,
-                project_id=project_id,
+                room_type_map
             )
             logger.info("Preferences parsed, %d rooms", len(prefs_graph.get("rooms", [])))
         else:

@@ -5,6 +5,11 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
+try:
+    from app.rules_svt import build_svt_grid, calc_svt_count
+    _RULES_SVT_OK = True
+except Exception:
+    _RULES_SVT_OK = False
 import numpy as np
 
 
@@ -418,85 +423,40 @@ def _nearest_interior_point(cx: float, cy: float, poly: list, step: int = 4) -> 
 
 def _build_lighting_zones(poly: list, area_m2: float, room_type: str) -> list:
     """
-    Строит сетку зон освещения внутри полигона комнаты.
-    Каждая зона — прямоугольник (x0,y0,x1,y1) с центром (cx,cy).
-    Зоны не выходят за bbox, центр каждой проверяется ray casting.
+    Строит сетку зон освещения по СП 52.13330.
+    Делегирует в rules_svt.build_svt_grid — единый источник правил.
+    Возвращает список {"rect": ..., "center": (x,y)} для совместимости.
     """
     if not poly or len(poly) < 3:
         return []
+
+    if _RULES_SVT_OK:
+        positions = build_svt_grid(poly, area_m2, room_type)
+    else:
+        # Fallback если rules_svt недоступен
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        positions = [(int(sum(xs)/len(xs)), int(sum(ys)/len(ys)))]
+
+    # Оборачиваем в формат {"rect": ..., "center": ...}
     xs = [p[0] for p in poly]
     ys = [p[1] for p in poly]
     bx0, bx1 = min(xs), max(xs)
     by0, by1 = min(ys), max(ys)
-    w, h = bx1 - bx0, by1 - by0
-
-    # Динамический margin: больше отступ для больших комнат
-    if area_m2 > 100:
-        margin = 120  # ← Увеличили для больших комнат
-    elif area_m2 > 50:
-        margin = 40
-    else:
-        margin = 30
-
-    # Применяем margin к bbox
-    bx0 += margin
-    bx1 -= margin
-    by0 += margin
-    by1 -= margin
-    w, h = bx1 - bx0, by1 - by0
-
-    # Проверка что margin не съел всю комнату
-    if w < 50 or h < 50:
-        # Fallback: минимальный margin
-        bx0 = min(xs) + 30
-        bx1 = max(xs) - 30
-        by0 = min(ys) + 30
-        by1 = max(ys) - 30
-        w, h = bx1 - bx0, by1 - by0
-
-    if room_type in ("bathroom", "toilet"):
-        n = 1
-    elif room_type == "corridor":
-        n = max(1, min(4, round(area_m2 / 8.0)))
-    elif room_type == "kitchen":
-        n = max(1, min(4, round(area_m2 / 10.0)))
-    else:
-        n = max(1, min(8, round(area_m2 / 30.0)))
-
-    aspect = w / max(1.0, h)
-    if n == 1:
-        cols, rows = 1, 1
-    elif n == 2:
-        cols, rows = (2, 1) if aspect >= 1.0 else (1, 2)
-    elif n <= 4:
-        cols, rows = 2, 2
-    elif n <= 6:
-        cols, rows = (3, 2) if aspect >= 1.0 else (2, 3)
-    else:
-        cols, rows = 3, 3
-
-    zw, zh = w / cols, h / rows
-    zones = []
-    for row in range(rows):
-        for col in range(cols):
-            zx0 = bx0 + zw * col
-            zy0 = by0 + zh * row
-            cx  = zx0 + zw / 2
-            cy  = zy0 + zh / 2
-            if _point_in_polygon(cx, cy, poly):
-                zones.append({
-                    "rect":   (int(zx0), int(zy0), int(zx0+zw), int(zy0+zh)),
-                    "center": (int(cx), int(cy)),
-                })
-            else:
-                # Fallback для L-образных и нестандартных комнат:
-                # сдвигаем центр к ближайшей внутренней точке
-                fx, fy = _nearest_interior_point(cx, cy, poly, step=4)
-                zones.append({
-                    "rect":   (int(zx0), int(zy0), int(zx0+zw), int(zy0+zh)),
-                    "center": (fx, fy),
-                })
-    return zones
+    n = len(positions)
+    if n == 0:
+        return []
+    # Размер ячейки для rect (только для визуализации зон)
+    zw = (bx1 - bx0) / max(1, round(n ** 0.5))
+    zh = (by1 - by0) / max(1, round(n ** 0.5))
+    return [
+        {
+            "rect":   (int(cx - zw/2), int(cy - zh/2),
+                       int(cx + zw/2), int(cy + zh/2)),
+            "center": (cx, cy),
+        }
+        for cx, cy in positions
+    ]
 
 
 def export_zones_preview(
@@ -602,35 +562,36 @@ def export_overlay_png(
     # Размещаем устройства
     placed = _place_devices_on_plan(devices, room_centroids, rooms, icon_r=icon_r)
 
-    # Рисуем трассы (если есть) — цветные линии по группам цепей
-    # Порядок: сначала слаботочка, потом розетки, потом освещение (поверх)
-    GROUP_ORDER = ["low_voltage", "sockets", "lighting"]
-    DEFAULT_COLORS = {
-        "lighting":    (0, 0, 220),    # красный (BGR)
-        "sockets":     (220, 50, 0),   # синий (BGR)
-        "low_voltage": (0, 200, 220),  # жёлтый (BGR)
+    # Рисуем трассы — цветные линии по группам цепей
+    # Цвета BGR: красный=освещение, синий=розетки, жёлтый=слаботочка
+    GROUP_COLORS_BGR = {
+        "lighting":    (0,   0,   220),   # красный
+        "sockets":     (220, 50,    0),   # синий
+        "low_voltage": (0,   200, 220),   # жёлтый
     }
-    routes_by_group = {g: [] for g in GROUP_ORDER}
-    routes_other = []
+    GROUP_THICKNESS = {"lighting": 2, "sockets": 2, "low_voltage": 1}
+    GROUP_ORDER     = ["low_voltage", "sockets", "lighting"]  # lighting поверх
 
+    # Сортируем маршруты по группам чтобы рисовать в правильном порядке
+    routes_by_group = {g: [] for g in GROUP_ORDER}
+    routes_other    = []
     for route in routes or []:
         if isinstance(route, dict):
             g = route.get("group", "")
             if g in routes_by_group:
                 routes_by_group[g].append(route)
-            else:
-                routes_other.append(route)
-        else:
-            routes_other.append(route)
+                continue
+        routes_other.append(route)
 
-    def _draw_route(route_item):
+    def _draw_route_line(route_item):
         points = None
-        color  = (0, 0, 200)
-        thickness = 2
+        color  = (100, 100, 100)
+        thick  = 2
         if isinstance(route_item, dict):
-            points    = route_item.get("points") or route_item.get("polyline")
-            color     = route_item.get("color_bgr", DEFAULT_COLORS.get(route_item.get("group", ""), (0,0,200)))
-            thickness = route_item.get("line_thickness", 2)
+            points = route_item.get("points") or route_item.get("polyline")
+            g      = route_item.get("group", "")
+            color  = GROUP_COLORS_BGR.get(g, (100, 100, 100))
+            thick  = GROUP_THICKNESS.get(g, 2)
         elif isinstance(route_item, (list, tuple)) and len(route_item) >= 2:
             line = route_item[1]
             if hasattr(line, "coords"):
@@ -643,38 +604,38 @@ def export_overlay_png(
                 ay = int(a[1] if isinstance(a, (list, tuple)) else a["y"])
                 bx = int(b[0] if isinstance(b, (list, tuple)) else b["x"])
                 by = int(b[1] if isinstance(b, (list, tuple)) else b["y"])
-                cv2.line(img, (ax, ay), (bx, by), color, thickness, cv2.LINE_AA)
+                cv2.line(img, (ax, ay), (bx, by), color, thick, cv2.LINE_AA)
             except Exception:
                 pass
 
     for g in GROUP_ORDER:
         for r in routes_by_group[g]:
-            _draw_route(r)
+            _draw_route_line(r)
     for r in routes_other:
-        _draw_route(r)
+        _draw_route_line(r)
 
     # Легенда групп цепей (правый нижний угол)
-    legend_groups = [g for g in GROUP_ORDER if routes_by_group.get(g)]
-    if legend_groups:
-        GROUP_LABELS = {
+    active_groups = [g for g in GROUP_ORDER if routes_by_group.get(g)]
+    if active_groups:
+        GROUP_LABELS_RU = {
             "lighting":    "Освещение (SVT/SWI)",
             "sockets":     "Розетки (RZT/LAN/TV)",
             "low_voltage": "Слаботочка (DYM/CO2)",
         }
-        row_h = 18
+        row_h = 20
         pad   = 8
-        lw    = 200
-        lh    = len(legend_groups) * row_h + pad * 2
+        lw    = 210
+        lh    = len(active_groups) * row_h + pad * 2
         lx    = w - lw - 10
         ly    = h - lh - 10
         cv2.rectangle(img, (lx, ly), (lx + lw, ly + lh), (255, 255, 255), -1)
         cv2.rectangle(img, (lx, ly), (lx + lw, ly + lh), (160, 160, 160), 1)
-        for i, g in enumerate(legend_groups):
+        for i, g in enumerate(active_groups):
             cy_leg = ly + pad + i * row_h + row_h // 2
-            color  = DEFAULT_COLORS.get(g, (100, 100, 100))
-            cv2.line(img, (lx + pad, cy_leg), (lx + pad + 20, cy_leg), color, 2, cv2.LINE_AA)
-            cv2.putText(img, GROUP_LABELS.get(g, g),
-                        (lx + pad + 26, cy_leg + 5),
+            color  = GROUP_COLORS_BGR.get(g, (100, 100, 100))
+            cv2.line(img, (lx + pad, cy_leg), (lx + pad + 22, cy_leg), color, 2, cv2.LINE_AA)
+            cv2.putText(img, GROUP_LABELS_RU.get(g, g),
+                        (lx + pad + 28, cy_leg + 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (30, 30, 30), 1, cv2.LINE_AA)
 
     # Рисуем устройства

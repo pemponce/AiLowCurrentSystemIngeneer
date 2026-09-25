@@ -22,6 +22,7 @@ from app.api_endpoints.ingest import router as ingest_router
 from app.api_endpoints.design import router as design_router
 from app.api_endpoints.export import router as export_router
 from app.api_endpoints.panel import router as panel_router
+from app.layout_debug import router as layout_debug_router
 
 # Глобальное хранилище
 from app.geometry import DB
@@ -87,6 +88,7 @@ app.include_router(ingest_router)
 app.include_router(design_router)
 app.include_router(export_router)
 app.include_router(panel_router)
+app.include_router(layout_debug_router)
 
 # Старые роутеры (совместимость)
 app.include_router(compare_router)

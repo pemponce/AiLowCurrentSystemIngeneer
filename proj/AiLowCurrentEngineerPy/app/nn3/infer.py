@@ -126,30 +126,14 @@ def _wall_point(kind: str, poly: list, room_cx: float, room_cy: float,
     by_len  = sorted(walls, key=lambda w: w["length"], reverse=True)
     h_walls = [w for w in walls if abs(w["angle"]) < 35 or abs(w["angle"]) > 145]
     k = kind.lower()
-    if "ceiling" in k or "smoke" in k or "co2" in k or "motion" in k:
-        if poly and len(poly) >= 3:
-            xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
-            x0, x1 = min(xs), max(xs)
-            y0, y1 = min(ys), max(ys)
-            w_r = x1 - x0
-            h_r = y1 - y0
-            aspect = w_r / max(1.0, h_r)
-            if aspect > 1.5:
-                cols, rows = 3, 2
-            elif aspect < 0.67:
-                cols, rows = 2, 3
-            else:
-                cols, rows = 2, 2
-            col = n_device % cols
-            row = (n_device // cols) % rows
-            pad_x = w_r * 0.15
-            pad_y = h_r * 0.15
-            step_x = (w_r - 2*pad_x) / max(1, cols-1) if cols > 1 else 0
-            step_y = (h_r - 2*pad_y) / max(1, rows-1) if rows > 1 else 0
-            return int(x0 + pad_x + col*step_x), int(y0 + pad_y + row*step_y)
-        step = 70
-        col, row = n_device % 3, n_device // 3
-        return int(room_cx + (col-1)*step), int(room_cy + (row-0.5)*step)
+    if "ceiling" in k:
+        # ceiling_lights НЕ размещаются через _wall_point.
+        # Их координаты генерирует _svt_grid_positions() в placement.py (zone-grid).
+        # Возвращаем None — постпроцессинг заменит все такие SVT на zone-grid.
+        return None, None
+    if "smoke" in k or "co2" in k or "motion" in k:
+        # Датчики — центроид комнаты (placement.py пересчитает по формуле Грина)
+        return int(room_cx), int(room_cy)
     elif "tv" in k:
         def _tv_score(w):
             dist = _math.hypot(w["cx"] - room_cx, w["cy"] - room_cy)

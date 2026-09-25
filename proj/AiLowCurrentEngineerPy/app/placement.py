@@ -15,6 +15,11 @@ import logging
 from typing import Dict, List, Optional, Tuple, Any
 from app.nn3.infer import _wall_point as _wp_norm2
 from app.export_overlay_png import _build_lighting_zones
+from app.rules_svt import (
+    calc_svt_count, build_svt_grid, get_wall_margin,
+    NO_SOCKET_ROOMS, NO_SMOKE_ROOMS, NO_CO2_ROOMS, ONLY_LIGHT_ROOMS,
+    RZT_M2_PER_UNIT, RZT_MAX_PER_ROOM,
+)
 
 logger = logging.getLogger("planner")
 
@@ -36,49 +41,10 @@ def _point_in_polygon(px: float, py: float, poly: list) -> bool:
 
 def _svt_grid_positions(poly: list, area_m2: float, room_type: str = "living_room") -> list:
     """
-    Возвращает список (px, py) центров зон освещения.
-    Использует те же зоны что и export_zones_preview — единый алгоритм.
+    Обёртка над build_svt_grid из rules_svt.
+    Возвращает список (px, py) позиций SVT по СП 52.13330.
     """
-    if not poly or len(poly) < 3:
-        return []
-    xs = [p[0] for p in poly]
-    ys = [p[1] for p in poly]
-    x0, x1 = min(xs), max(xs)
-    y0, y1 = min(ys), max(ys)
-    w, h = x1 - x0, y1 - y0
-
-    if room_type in ("bathroom", "toilet", "balcony"):
-        needed = 1
-    elif room_type == "corridor":
-        needed = max(1, min(4, round(area_m2 / 8.0)))
-    elif room_type == "kitchen":
-        needed = max(1, min(4, round(area_m2 / 10.0)))
-    else:
-        needed = max(1, min(8, round(area_m2 / 16.0)))
-
-    aspect = w / max(1.0, h)
-    if needed == 1:
-        cols, rows = 1, 1
-    elif needed == 2:
-        cols, rows = (2, 1) if aspect >= 1.0 else (1, 2)
-    elif needed <= 4:
-        cols, rows = 2, 2
-    elif needed <= 6:
-        cols, rows = (3, 2) if aspect >= 1.0 else (2, 3)
-    else:
-        cols, rows = (3, 3) if needed <= 9 else (4, 3)
-
-    try:
-        zones = _build_lighting_zones(poly, area_m2, room_type)
-        positions = [z["center"] for z in zones]
-        if positions:
-            return positions
-    except Exception:
-        pass
-
-    xs = [p[0] for p in poly]
-    ys = [p[1] for p in poly]
-    return [(int(sum(xs)/len(xs)), int(sum(ys)/len(ys)))]
+    return build_svt_grid(poly, area_m2, room_type)
 
 
 def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: list = None, skip_rooms: list = None) -> dict:
@@ -294,9 +260,17 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
         _rid = r.get("id") or r.get("roomId") or r.get("room_id") or ""
         if isinstance(_rid, int):
             _rid = f"room_{_rid:03d}"
-        _area = float(r.get("areaM2") or r.get("area_m2") or 0)
-        if _rid:
+        # area_px → m² через коэффициент ~100px/м (196px² = 1m²)
+        _area_px = float(r.get("area_px") or 0)
+        _area = float(
+            r.get("areaM2") or r.get("area_m2") or
+            (_area_px * 0.000196 if _area_px > 0 else 0)
+        )
+        if _rid and _area > 0:
             room_area_map[_rid] = _area
+        elif _rid and _area_px > 0:
+            # Даже если m² не известна — даём 10m² как минимум для zone-grid
+            room_area_map[_rid] = max(5.0, _area_px * 0.000196)
 
     import math as _math
     for room_id, rtype in room_type_map.items():
@@ -316,14 +290,40 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
             _rid_raw = _r.get("id") or _r.get("roomId") or _r.get("room_id") or ""
             _rid_norm = f"room_{_rid_raw:03d}" if isinstance(_rid_raw, int) else str(_rid_raw)
             if _rid_norm == room_id or _rid_raw == room_id:
-                _room_poly_norm = _r.get("polygonPx") or []
+                raw_poly = _r.get("polygonPx") or _r.get("polygon") or []
+                # polygon от NN-1 может быть numpy array shape (N,1,2) — нормализуем
+                _room_poly_norm = []
+                for pt in raw_poly:
+                    if hasattr(pt, "__len__") and len(pt) == 1:
+                        pt = pt[0]  # shape (1,2) → (2,)
+                    if hasattr(pt, "__len__") and len(pt) >= 2:
+                        try:
+                            _room_poly_norm.append((float(pt[0]), float(pt[1])))
+                        except Exception:
+                            pass
+                    elif isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                        _room_poly_norm.append((float(pt[0]), float(pt[1])))
                 break
+
+        # Если polygon не найден — пробуем получить из других источников
+        if not _room_poly_norm:
+            for _r in (rooms or []):
+                if not isinstance(_r, dict): continue
+                _rid_raw = _r.get("id") or _r.get("roomId") or _r.get("room_id") or ""
+                _rid_norm = f"room_{_rid_raw:03d}" if isinstance(_rid_raw, int) else str(_rid_raw)
+                if _rid_norm == room_id or _rid_raw == room_id:
+                    # Пробуем bbox как запасной вариант
+                    bbox = _r.get("bbox")
+                    if bbox and len(bbox) == 4:
+                        x, y, w, h = bbox
+                        _room_poly_norm = [(x,y),(x+w,y),(x+w,y+h),(x,y+h)]
+                    break
 
         # Вычисляем оптимальные позиции SVT по сетке зон освещения
         svt_positions = _svt_grid_positions(_room_poly_norm, area, rtype)
         needed_svt = len(svt_positions)
 
-        if _room_poly_norm and needed_svt > 0:
+        if needed_svt > 0:
             # Проверяем сколько SVT уже есть в комнате
             current_svt = [
                 d for d in filtered_devices
@@ -331,37 +331,80 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
                    and (d.get("roomRef") == room_id or d.get("room_id") == room_id)
             ]
 
-            # Если SVT уже достаточно (от NN-3 или forced) — НЕ трогаем!
-            if len(current_svt) >= needed_svt:
-                logger.info(f"  Room {room_id}: keeping {len(current_svt)} SVT (enough)")
-                continue  # Переходим к следующей комнате
+            # Проверяем качество текущих SVT:
+            # SVT с mount=wall или без координат — некорректные, нужно заменить
+            bad_svt = [
+                d for d in current_svt
+                if d.get("mount") == "wall"
+                or d.get("xPx") is None
+                or d.get("yPx") is None
+            ]
+            good_svt = [d for d in current_svt if d not in bad_svt]
 
-            # Если SVT меньше нужного — удаляем старые и добавляем zone grid
-            logger.info(f"  Room {room_id}: replacing {len(current_svt)} SVT with {needed_svt} zone grid")
+            # Если SVT достаточно И все хорошего качества — не трогаем
+            if len(current_svt) >= needed_svt and len(bad_svt) == 0:
+                logger.info(f"  Room {room_id}: keeping {len(current_svt)} SVT (enough, all ceiling-mounted)")
+                continue
 
-            new_filtered_devices = []
-            for d in filtered_devices:
-                if d.get("kind") == "ceiling_lights":
-                    if d.get("roomRef") == room_id or d.get("room_id") == room_id:
-                        logger.debug(f"  REMOVING SVT from {room_id}: replaced by zone grid")
-                        continue
-                new_filtered_devices.append(d)
+            if bad_svt:
+                logger.info(
+                    f"  Room {room_id}: {len(bad_svt)} SVT with bad mount (wall/no-coords) → replacing with zone grid"
+                )
+            else:
+                logger.info(f"  Room {room_id}: replacing {len(current_svt)} SVT with {needed_svt} zone grid")
 
+            # Удаляем некорректные SVT (wall-mounted или без координат)
+            # Хорошие SVT (ceiling, с координатами) оставляем
+            bad_svt_ids = {d["id"] for d in bad_svt}
+            new_filtered_devices = [
+                d for d in filtered_devices
+                if not (
+                    d.get("kind") == "ceiling_lights"
+                    and (d.get("roomRef") == room_id or d.get("room_id") == room_id)
+                    and d.get("id") in bad_svt_ids
+                )
+            ]
             filtered_devices = new_filtered_devices
 
+            # Сколько ещё нужно добавить
+            remaining_good = sum(
+                1 for d in filtered_devices
+                if d.get("kind") == "ceiling_lights"
+                and (d.get("roomRef") == room_id or d.get("room_id") == room_id)
+            )
+            svt_to_add = max(0, needed_svt - remaining_good)
+            if svt_to_add == 0:
+                continue
+            svt_positions = svt_positions[:svt_to_add]
+
             for k, (px_svt, py_svt) in enumerate(svt_positions):
-                too_close_to_dym = False
+                # Минимальное расстояние SVT от DYM зависит от размера комнаты
+                # Для маленьких комнат (< 15m²) используем меньший порог
+                min_dym_dist = 60 if area < 15 else 100
                 for d in filtered_devices:
-                    if d.get("kind") == "smoke_detector" and d.get("roomRef") == room_id:
+                    if d.get("kind") == "smoke_detector" and (
+                        d.get("roomRef") == room_id or d.get("room_id") == room_id
+                    ):
                         dym_x = d.get("xPx", 0)
                         dym_y = d.get("yPx", 0)
                         dist = ((px_svt - dym_x) ** 2 + (py_svt - dym_y) ** 2) ** 0.5
-                        if dist < 100:  # Минимум 100px между SVT и DYM
-                            too_close_to_dym = True
+                        if dist < min_dym_dist:
+                            # Сдвигаем SVT от DYM вместо пропуска
+                            shift = min_dym_dist - dist + 10
+                            if dist > 0.1:
+                                dx = (px_svt - dym_x) / dist
+                                dy = (py_svt - dym_y) / dist
+                            else:
+                                dx, dy = 1.0, 0.0
+                            px_svt = int(px_svt + dx * shift)
+                            py_svt = int(py_svt + dy * shift)
+                            # Clamp внутри bbox
+                            if _room_poly_norm:
+                                _xs = [p[0] for p in _room_poly_norm]
+                                _ys = [p[1] for p in _room_poly_norm]
+                                px_svt = max(min(_xs)+5, min(px_svt, max(_xs)-5))
+                                py_svt = max(min(_ys)+5, min(py_svt, max(_ys)-5))
                             break
-
-                if too_close_to_dym:
-                    continue  # Пропускаем этот SVT
 
                 # Добавляем SVT
                 dev_id = f"{room_id}_ceiling_lights_zone_{k}"
@@ -377,25 +420,7 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
                     "yPx": py_svt,
                 })
 
-                # ═══════════════════════════════════════════════════════════════════════
-                # ВАЛИДАЦИЯ ПОЗИЦИЙ SVT (НОВОЕ - ДОБАВЬ ЭТИ СТРОКИ)
-                # ═══════════════════════════════════════════════════════════════════════
-                from app.svt_validator import apply_svt_validation_to_design_graph
 
-                # Создаём временный design_graph для валидации
-                design_graph_temp = {
-                    "devices": filtered_devices,
-                    "roomDesigns": room_designs,
-                    "totalDevices": len(filtered_devices),
-                    "explain": design_graph.get("explain", [])
-                }
-
-                # Применяем валидацию SVT
-                design_graph_temp = apply_svt_validation_to_design_graph(design_graph_temp, rooms or [])
-
-                # Обновляем filtered_devices валидированными устройствами
-                filtered_devices = design_graph_temp["devices"]
-                # ═══════════════════════════════════════════════════════════════════════
 
     # ── Коррекция позиций DYM/CO2 — потолок, центр комнаты (СП 484) ──────────
     for d in filtered_devices:
@@ -558,6 +583,13 @@ def _apply_hard_rules(design_graph: dict, forced_devices: dict = None, rooms: li
             if _walls_swi:
                 _shortest = min(_walls_swi, key=lambda w: w["len"])
                 door_points = [{"cx": _shortest["cx"], "cy": _shortest["cy"]}]
+
+        # Удаляем старые SWI этой комнаты (от NN-3 или forced) — заменяем нормативными
+        filtered_devices = [
+            d for d in filtered_devices
+            if not (d.get("kind") == "switch"
+                    and (d.get("roomRef") == room_id or d.get("room_id") == room_id))
+        ]
 
         for di, door in enumerate(door_points):
             dx = float(door.get("cx") or door.get("x") or 0)

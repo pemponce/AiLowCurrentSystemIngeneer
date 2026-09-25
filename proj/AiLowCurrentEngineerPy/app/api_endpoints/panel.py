@@ -71,6 +71,16 @@ async def get_panel(project_id: str):
     return {"project_id": project_id, "panel": panel}
 
 
+@router.get("/app", response_class=HTMLResponse)
+async def mvp_app():
+    """MVP UI — полный pipeline в браузере."""
+    html_path = osp.join(osp.dirname(__file__), "..", "static", "mvp_ui.html")
+    if osp.exists(html_path):
+        with open(html_path, encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse(content="<h1>mvp_ui.html not found</h1>", status_code=404)
+
+
 @router.get("/ui", response_class=HTMLResponse)
 async def panel_ui(project_id: str = ""):
     """

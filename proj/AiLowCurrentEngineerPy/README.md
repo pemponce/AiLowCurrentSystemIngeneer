@@ -155,8 +155,8 @@ $b64 | Set-Clipboard
 **Request:**
 ```json
 {
-  "projectId": "plan001",
-  "srcKey": "raw_plans/plan001.png"
+  "projectId": "plan_001",
+  "srcKey": "raw_plans/plan001/b064c6c8-8544-41ad-a0ca-accefb20738b.png"
 }
 ```
 
